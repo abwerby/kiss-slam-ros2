@@ -28,6 +28,13 @@ from kiss_slam.config import LoopCloserConfig
 from kiss_slam.local_map_graph import LocalMapGraph
 from kiss_slam.voxel_map import VoxelMap
 
+try:
+    from rclpy.logging import get_logger
+    def logger(txt):
+        get_logger("kiss_slam").info(txt)
+except ImportError:
+    def logger(txt):
+        print(txt)
 
 class LoopCloser:
     def __init__(self, config: LoopCloserConfig):
@@ -50,7 +57,8 @@ class LoopCloser:
             ref_id = closure.source_id
             source = local_map_graph[ref_id].pcd
             target = local_map_graph[query_id].pcd
-            print("\nKissSLAM| Closure Detected")
+            # print("\nKissSLAM| Closure Detected")
+            logger(f"KissSLAM| Closure Detected: {ref_id} -> {query_id} with {closure.number_of_inliers} inliers")
             is_good, pose_constraint = self.validate_closure(source, target, closure.pose)
         return is_good, ref_id, query_id, pose_constraint
 
@@ -76,9 +84,12 @@ class LoopCloser:
         intersection = num_source_voxels + num_target_voxels - union
         overlap = intersection / np.min([num_source_voxels, num_target_voxels])
         closure_is_accepted = overlap > self.overlap_threshold
-        print(f"KissSLAM| LocalMaps Overlap: {overlap}")
+        # print(f"KissSLAM| LocalMaps Overlap: {overlap}")
+        logger(f"KissSLAM| LocalMaps Overlap: {overlap:.2f} (Threshold: {self.overlap_threshold})")
         if closure_is_accepted:
-            print("KissSLAM| Closure Accepted")
+            # print("KissSLAM| Closure Accepted")
+            logger("KissSLAM| Closure Accepted")
         else:
-            print(f"KissSLAM| Closure rejected for low overlap.")
+            # print(f"KissSLAM| Closure rejected for low overlap.")
+            logger("KissSLAM| Closure rejected for low overlap.")
         return closure_is_accepted, pose

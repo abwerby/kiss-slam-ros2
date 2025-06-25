@@ -31,6 +31,14 @@ from kiss_slam.pose_graph_optimizer import PoseGraphOptimizer
 from kiss_slam.voxel_map import VoxelMap
 
 
+try:
+    from rclpy.logging import get_logger
+    def logger(txt):
+        get_logger("kiss_slam").info(txt)
+except ImportError:
+    def logger(txt):
+        print(txt)
+
 def transform_points(pcd, T):
     R = T[:3, :3]
     t = T[:3, -1]
@@ -66,6 +74,7 @@ class KissSLAM:
         self.local_map_graph.last_local_map.local_trajectory.append(current_pose)
         traveled_distance = np.linalg.norm(current_pose[:3, -1])
         if traveled_distance > self.local_map_splitting_distance:
+            logger(f"New local map generated at {timestamps[-1]}")
             self.generate_new_node()
 
     def compute_closures(self, query_id, query):
@@ -93,7 +102,7 @@ class KissSLAM:
 
         self.odometry.local_map.clear()
         self.odometry.local_map.add_points(transformed_local_map)
-        self.odometry.last_pose = np.eye(4)
+        self.odometry.last_pose = np.eye(4)  
 
         query_id = last_local_map.id
         query_points = self.voxel_grid.point_cloud()
