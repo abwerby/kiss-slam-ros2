@@ -1,0 +1,53 @@
+slam_node:
+  ros__parameters:
+    # General
+    map_frame: "map"
+    odom_frame: "odom_lidar"
+    base_frame: "base_link"
+    
+    # Threading parameters
+    loop_closure_threshold: 5  # Minimum number of local maps before triggering loop closure
+    optimization_frequency: 1.0  # Hz for periodic optimization
+
+    # KISS-SLAM parameters
+    kiss_slam:
+      odometry:
+          preprocessing:
+              max_range: 100.0
+              min_range: 0.0
+              deskew: true
+          registration:
+              max_num_iterations: 500
+              convergence_criterion: 0.0001
+              max_num_threads: 0
+          mapping:
+              voxel_size: -1.0  # -1.0 represents null
+              max_points_per_voxel: 20
+          adaptive_threshold:
+              fixed_threshold: -1.0  # -1.0 represents null
+              initial_threshold: 2.0
+              min_motion_th: 0.1
+
+      local_mapper:
+          voxel_size: 0.2
+          splitting_distance: 5.0
+
+      occupancy_mapper:
+          free_threshold: 0.2
+          occupied_threshold: 0.65
+          resolution: 0.5
+          max_range: -1.0  # -1.0 represents null
+          z_min: 0.1
+          z_max: 0.5
+
+      loop_closer:
+          detector:
+              density_map_resolution: 0.2
+              density_threshold: 0.05
+              hamming_distance_threshold: 50
+              inliers_threshold: 5
+          overlap_threshold: 0.4
+
+      pose_graph_optimizer:
+          max_iterations: 10
+

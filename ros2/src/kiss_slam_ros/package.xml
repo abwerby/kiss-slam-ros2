@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>kiss_slam_ros</name>
+  <version>0.0.1</version>
+  <description>ROS2 wrapper for kiss-slam</description>
+  <maintainer email="abdelrhman.werby@ki.uni-stuttgart.de">user</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>tf2_ros_py</depend>
+  <depend>kiss_slam</depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
