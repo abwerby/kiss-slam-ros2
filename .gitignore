@@ -76,6 +76,10 @@ develop-eggs/
 dist/
 downloads/
 eggs/
+slam_output/
+ros2/build/
+ros2/log/
+ros2/install/
 .eggs/
 lib/
 lib64/

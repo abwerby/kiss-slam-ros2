@@ -49,9 +49,51 @@ kiss_slam_dump_config
 
 which will generate a `kiss_slam.yaml` file. Now, you can modify the parameters and pass the file to the `--config` option when running the `kiss_slam_pipeline`.
 
-Suggestion for indoor applications:
-1. Reduce the `odometry.preprocessing.max_range` to 50.0, this will automatically reduce the `voxel_size` to 0.5.
-2. Reduce the `local_mapper.splitting_distance` to a suitable distance based on the scale of the indoor environment.
+## Running with ROS2
+
+To run the ROS2 wrapper, you first need to build the ROS2 workspace.
+
+#### Build the workspace
+
+```bash
+cd ros2
+colcon build --symlink-install
+```
+
+#### Source the workspace
+
+Before running the node, you need to source the workspace to make the packages available in your environment:
+
+```bash
+source ros2/install/setup.bash
+```
+
+#### Launch the SLAM node
+
+Now you can launch the SLAM node using the provided launch file:
+
+```bash
+ros2 launch kiss_slam_ros slam.launch.py
+```
+
+This will start the `slam_node` which will subscribe to the `/points_raw` topic.
+
+You can customize the launch by setting the following arguments:
+*   `topic`: The input point cloud topic. Default: `/ouster/points`.
+*   `visualize`: Whether to launch RViz. Default: `true`.
+*   `bagfile`: Path to a rosbag to play. If provided.
+*   `use_sim_time`: Whether to use simulation time. Default: `true`.
+*   `base_frame`: The base frame of the robot. Default: `base_link`.
+*   `odom_frame`: The odometry frame. Default: `odom`.
+
+For example, to run with a different topic and without visualization and with s
+```bash
+ros2 launch kiss_slam_ros slam.launch.py bagfile:=/path/tobag topic:=/my_points visualize:=false
+```
+
+
+You can also change the SLAM parameters by editing the `ros2/src/kiss_slam_ros/config/params.yaml` file.
+
 
 ### Install Python API (developer mode)
 For development purposes:
@@ -80,14 +122,3 @@ If you use this library for any academic work, please cite our original paper:
 ## Acknowledgements
 This project builds on top of [KISS-ICP](https://github.com/PRBonn/kiss-icp), [MapClosures](https://github.com/PRBonn/MapClosures), and [g2o](https://github.com/RainerKuemmerle/g2o).
 
-## Contributing
-
-We envision KISS-SLAM as a community-driven project. We love to see how the project is growing, thanks to the contributions from the community. We would love to see your face in the list below; open a Pull Request!
-
-<a href="https://github.com/PRBonn/kiss-slam/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=PRBonn/kiss-slam" />
-</a>
-
-## Contact Us
-For questions or feedback:
-- GitHub Issues: https://github.com/PRBonn/kiss-slam/issues
