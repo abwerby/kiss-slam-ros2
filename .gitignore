@@ -83,6 +83,9 @@ parts/
 sdist/
 var/
 wheels/
+ros2/build/
+ros2/install/
+ros2/log/
 share/python-wheels/
 *.egg-info/
 .installed.cfg
