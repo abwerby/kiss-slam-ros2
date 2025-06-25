@@ -2,7 +2,7 @@ slam_node:
   ros__parameters:
     # General
     map_frame: "map"
-    odom_frame: "odom_lidar"
+    odom_frame: "odom"
     base_frame: "base_link"
     
     # Threading parameters
