@@ -9,6 +9,12 @@ slam_node:
     loop_closure_threshold: 5  # Minimum number of local maps before triggering loop closure
     optimization_frequency: 1.0  # Hz for periodic optimization
 
+    # Map saving configuration
+    save_final_map: true  # Whether to save final optimized map on shutdown
+    map_save_directory: "tmp/kiss_slam_maps"  # Directory to save maps
+    save_2d_map: true  # Save 2D occupancy grid
+    save_3d_map: true  # Save 3D voxel map
+
     # KISS-SLAM parameters
     kiss_slam:
       odometry:
@@ -35,7 +41,7 @@ slam_node:
       occupancy_mapper:
           free_threshold: 0.2
           occupied_threshold: 0.65
-          resolution: 0.2
+          resolution: 0.1
           max_range: -1.0  # -1.0 represents null
           z_min: 0.1
           z_max: 0.5

@@ -1,4 +1,3 @@
-
 from rclpy.node import Node
 from kiss_slam.config.config import (
     KissSLAMConfig, 
@@ -78,6 +77,12 @@ def declare_parameters(node: Node):
     
     # Pose graph optimizer parameters
     node.declare_parameter('kiss_slam.pose_graph_optimizer.max_iterations', 10)
+    
+    # Map saving parameters
+    node.declare_parameter('save_final_map', False)
+    node.declare_parameter('map_save_directory', '/tmp/kiss_slam_maps')
+    node.declare_parameter('save_2d_map', True)
+    node.declare_parameter('save_3d_map', True)
 
 def get_kiss_slam_config(node: Node) -> KissSLAMConfig:
     config = KissSLAMConfig(

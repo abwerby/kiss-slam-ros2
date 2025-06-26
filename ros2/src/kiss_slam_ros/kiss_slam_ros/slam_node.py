@@ -1,3 +1,11 @@
+import os
+import time
+from pathlib import Path
+from typing import List, Tuple
+from datetime import datetime
+from map_closures import map_closures
+from tqdm import tqdm, trange
+
 from scipy.spatial.transform import Rotation as R
 import rclpy
 from rclpy.node import Node
@@ -31,6 +39,12 @@ class SlamNode(Node):
         self.loop_closure_threshold = self.get_parameter('loop_closure_threshold').get_parameter_value().integer_value
         self.optimization_frequency = self.get_parameter('optimization_frequency').get_parameter_value().double_value
 
+        # Map saving parameters
+        self.save_final_map = self.get_parameter('save_final_map').get_parameter_value().bool_value
+        self.map_save_directory = self.get_parameter('map_save_directory').get_parameter_value().string_value
+        self.save_2d_map = self.get_parameter('save_2d_map').get_parameter_value().bool_value
+        self.save_3d_map = self.get_parameter('save_3d_map').get_parameter_value().bool_value
+
         # Build KISS-SLAM config
         config = get_kiss_slam_config(self)
         
@@ -46,11 +60,23 @@ class SlamNode(Node):
             f'  Local Mapper Config: {config.local_mapper}\n'
             f'  Occupancy Mapper Config: {config.occupancy_mapper}\n'
             f'  Loop Closer Config: {config.loop_closer}\n'
-            f'  Pose Graph Optimizer Config: {config.pose_graph_optimizer}'
+            f'  Pose Graph Optimizer Config: {config.pose_graph_optimizer}\n'
+            f'ROS2 Parameters:\n'
+            f'  Save Final Map: {self.save_final_map}\n'
+            f'  Map Save Directory: {self.map_save_directory}\n'
+            f'  Save 2D Map: {self.save_2d_map}\n'
+            f'  Save 3D Map: {self.save_3d_map}\n'
         )
 
         self.slam = KissSLAM(config)
         self.occupancy_mapper = OccupancyGridMapper(config.occupancy_mapper)
+        self.slam_config = config  # Store config for later use
+        
+        # Store scans for final map generation if map saving is enabled
+        self.stored_scans: List[Tuple[np.ndarray, np.ndarray]] = []  # (points, timestamps)
+        self.final_map_occupancy_mapper = None
+        if self.save_final_map:
+            self.final_map_occupancy_mapper = OccupancyGridMapper(config.occupancy_mapper)
         
         
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
@@ -59,7 +85,7 @@ class SlamNode(Node):
         self.local_pose_pub = self.create_publisher(PoseStamped, 'local_pose', 10)
         self.global_path_pub = self.create_publisher(Path, 'global_path', 10)
         self.global_pose_pub = self.create_publisher(PoseStamped, 'global_pose', 10)
-        self.map_pub = self.create_publisher(OccupancyGrid, '/map', 1)
+        self.map_pub = self.create_publisher(OccupancyGrid, '/map', 10)
     
 
         self.last_map_correction = np.eye(4)  # Last map->odom correction
@@ -83,7 +109,7 @@ class SlamNode(Node):
         self.global_path_msg = Path()
 
         # Create timer for occupancy grid publishing at 1Hz
-        self.map_timer = self.create_timer(1.0, self.publish_occupancy_grid)
+        self.map_timer = self.create_timer(.2, self.publish_occupancy_grid)
         
         # Store the latest lidar message timestamp for map publishing
         self.latest_lidar_timestamp = None
@@ -97,6 +123,10 @@ class SlamNode(Node):
 
         # Odometry processing (no threading)
         self.slam.process_scan(points, timestamps)
+
+        # Store scan for final map generation if enabled
+        if self.save_final_map:
+            self.stored_scans.append((points.copy(), timestamps.copy()))
 
         # Store the latest lidar timestamp for map publishing
         self.latest_lidar_timestamp = msg.header.stamp
@@ -279,16 +309,105 @@ class SlamNode(Node):
         except Exception as e:
             self.get_logger().warn(f'Failed to publish occupancy grid: {str(e)}')
 
+    def save_final_map_data(self):
+        """Save the final optimized map using all stored scans and optimized poses"""
+        if not self.save_final_map or not self.stored_scans:
+            return
+            
+        try:
+            print("Generating final optimized map...")
+            
+            # Get final optimized poses
+            final_poses = self.slam.poses
+            if len(final_poses) != len(self.stored_scans):
+                print(f"Pose count ({len(final_poses)}) doesn't match scan count ({len(self.stored_scans)})")
+                return
+                
+            # Create output directory with timestamp
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            output_dir = os.path.join(self.map_save_directory, f"kiss_slam_map_{timestamp}")
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # Initialize final map occupancy mapper
+            final_occupancy_mapper = OccupancyGridMapper(self.final_map_occupancy_mapper.config)
+            
+            # Get reference ground alignment from the first local map
+            # if len(self.slam.local_map_graph.graph) > 0:
+            #     first_local_map = self.slam.local_map_graph[0]
+            #     ref_ground_alignment = map_closures.align_map_to_local_ground(
+            #         first_local_map.pcd.point.positions.cpu().numpy(),
+            #         self.slam_config.odometry.mapping.voxel_size,
+            #     )
+            # else:
+            ref_ground_alignment = np.eye(4)
+            
+            print(f"Processing {len(self.stored_scans)} scans for final map generation...")
+            
+            # Process all stored scans with optimized poses
+            for idx, ((points, timestamps), pose) in enumerate(zip(self.stored_scans, final_poses)):
+                if idx % 100 == 0:  # Log progress every 100 scans
+                    print(f"Processing scan {idx+1}/{len(self.stored_scans)}")
+                    
+                # Apply ground alignment and optimized pose
+                aligned_pose = ref_ground_alignment @ pose
+                final_occupancy_mapper.integrate_frame(points, aligned_pose)
+            
+            # Compute occupancy information
+            print("Computing 3D occupancy information...")
+            final_occupancy_mapper.compute_3d_occupancy_information()
+            
+            # Save 3D map if requested
+            if self.save_3d_map:
+                print("Saving 3D occupancy grid...")
+                occupancy_3d_dir = os.path.join(output_dir, "occupancy_3d")
+                os.makedirs(occupancy_3d_dir, exist_ok=True)
+                final_occupancy_mapper.write_3d_occupancy_grid(occupancy_3d_dir)
+            
+            # Save 2D map if requested
+            if self.save_2d_map:
+                print("Computing and saving 2D occupancy grid...")
+                final_occupancy_mapper.compute_2d_occupancy_information()
+                occupancy_2d_dir = os.path.join(output_dir, "occupancy_2d")
+                os.makedirs(occupancy_2d_dir, exist_ok=True)
+                final_occupancy_mapper.write_2d_occupancy_grid(occupancy_2d_dir)
+            
+            # Save trajectory
+            trajectory_file = os.path.join(output_dir, "trajectory.txt")
+            with open(trajectory_file, 'w') as f:
+                for pose in final_poses:
+                    # Write pose as translation and quaternion
+                    t = pose[:3, 3]
+                    q = R.from_matrix(pose[:3, :3]).as_quat()  # [x, y, z, w]
+                    f.write(f"{t[0]:.6f} {t[1]:.6f} {t[2]:.6f} {q[0]:.6f} {q[1]:.6f} {q[2]:.6f} {q[3]:.6f}\n")
+            
+            # Save pose graph
+            if hasattr(self.slam, 'pose_graph'):
+                graph_file = os.path.join(output_dir, "pose_graph.g2o")
+                self.slam.pose_graph.write_graph(graph_file)
+            
+            print(f"Final map saved successfully to: {output_dir}")
+            
+        except Exception as e:
+            self.get_logger().error(f"Failed to save final map: {str(e)}")
+
     def destroy_node(self):
-        """Clean shutdown"""
+        """Clean shutdown with optional map saving"""
+        if self.save_final_map:
+            # self.get_logger().info("Saving final optimized map before shutdown...")
+            self.save_final_map_data()
         super().destroy_node()
 
 def main(args=None):
     rclpy.init(args=args)
     node = SlamNode()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        node.get_logger().info('KeyboardInterrupt: shutting down')
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':

@@ -1,6 +1,8 @@
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, RegisterEventHandler
 from launch.conditions import IfCondition
+from launch.event_handlers import OnProcessExit
+from launch.actions import Shutdown
 from launch.substitutions import (
     LaunchConfiguration,
     PathJoinSubstitution,
@@ -12,13 +14,9 @@ from launch_ros.substitutions import FindPackageShare
 
 def generate_launch_description():
     # Launch arguments
-    use_sim_time = LaunchConfiguration("use_sim_time", default="true")
     topic = LaunchConfiguration("topic", default="/ouster/points")
     visualize = LaunchConfiguration("visualize", default="true")
     bagfile = LaunchConfiguration("bagfile", default="")
-    base_frame = LaunchConfiguration("base_frame", default="base_link")
-    odom_frame = LaunchConfiguration("odom_frame", default="odom")
-    map_frame = LaunchConfiguration("map_frame", default="map")
 
     # KISS-SLAM node
     slam_node = Node(
@@ -32,13 +30,7 @@ def generate_launch_description():
         parameters=[
             PathJoinSubstitution(
                 [FindPackageShare("kiss_slam_ros"), "config", "params.yaml"]
-            ),
-            {
-                "use_sim_time": use_sim_time,
-                "base_frame": base_frame,
-                "odom_frame": odom_frame,
-                "map_frame": map_frame,
-            }
+            )
         ],
     )
 
@@ -52,13 +44,15 @@ def generate_launch_description():
             PathJoinSubstitution(
                 [FindPackageShare("kiss_slam_ros"), "rviz", "slam.rviz"]
             ),
+            "require=true",
         ],
         condition=IfCondition(visualize),
     )
 
     # Bag playback
     bagfile_play = ExecuteProcess(
-        cmd=["ros2", "bag", "play", "--rate", "2", bagfile, "--clock", "1000.0"],
+        # --remap /j100_0819/tf:=/tf /j100_0819/tf_static:=/tf_static
+        cmd=["ros2", "bag", "play", "--rate", "1", bagfile, "--clock", "1000.0", "--remap", "/j100_0819/tf:=/tf", "--remap", "/j100_0819/tf_static:=/tf_static"],
         output="screen",
         condition=IfCondition(PythonExpression(["'", bagfile, "' != ''"])),
     )
@@ -72,8 +66,18 @@ def generate_launch_description():
             DeclareLaunchArgument("base_frame", default_value="base_link"),
             DeclareLaunchArgument("odom_frame", default_value="odom"),
             DeclareLaunchArgument("map_frame", default_value="map"),
+            DeclareLaunchArgument("save_final_map", default_value="false"),
+            DeclareLaunchArgument("map_save_directory", default_value="/tmp/kiss_slam_maps"),
+            DeclareLaunchArgument("save_2d_map", default_value="true"),
+            DeclareLaunchArgument("save_3d_map", default_value="true"),
             slam_node,
             bagfile_play,
-            rviz_node
+            rviz_node,
+            RegisterEventHandler(
+                OnProcessExit(
+                    target_action=bagfile_play,
+                    on_exit=[Shutdown()]
+                )
+            ),
         ]
     )
