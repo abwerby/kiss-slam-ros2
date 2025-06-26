@@ -1,5 +1,5 @@
 <div align="center">
-    <h1>KISS-SLAM</h1>
+    <h1>KISS-SLAM-ROS2</h1>
     <a href="https://github.com/PRBonn/kiss-slam/releases"><img src="https://img.shields.io/github/v/release/PRBonn/kiss-slam?label=version" /></a>
     <a href="https://github.com/PRBonn/kiss-slam/blob/main/LICENSE"><img src="https://img.shields.io/github/license/PRBonn/kiss-slam" /></a>
     <a href="https://github.com/PRBonn/kiss-slam/blob/main/"><img src="https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black" /></a>

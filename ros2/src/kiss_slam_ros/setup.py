@@ -2,7 +2,7 @@ from setuptools import setup
 import os
 from glob import glob
 
-package_name = 'kiss_slam_ros2'
+package_name = 'kiss_slam_ros'
 
 setup(
     name=package_name,
