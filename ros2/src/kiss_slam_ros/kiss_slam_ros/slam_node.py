@@ -1,5 +1,4 @@
 from scipy.spatial.transform import Rotation as R
-import time
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
@@ -7,22 +6,16 @@ from sensor_msgs.msg import PointCloud2
 from geometry_msgs.msg import PoseStamped, TransformStamped
 from sensor_msgs_py import point_cloud2 as pc2
 
-from nav_msgs.msg import Path
+from nav_msgs.msg import Path, OccupancyGrid
 import tf2_ros
 import numpy as np
 from kiss_slam.slam import KissSLAM
+from kiss_slam.occupancy_mapper import OccupancyGridMapper
 from kiss_slam_ros.utils.config import declare_parameters, get_kiss_slam_config
+
 
 # setup rclpy logging
 rclpy.logging.set_logger_level('kiss_slam_ros', rclpy.logging.LoggingSeverity.INFO)
-
-
-
-def transform_points(pcd, T):
-    R = T[:3, :3]
-    t = T[:3, -1]
-    return pcd @ R.T + t
-
 
 class SlamNode(Node):
     def __init__(self):
@@ -57,12 +50,16 @@ class SlamNode(Node):
         )
 
         self.slam = KissSLAM(config)
+        self.occupancy_mapper = OccupancyGridMapper(config.occupancy_mapper)
+        
+        
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
         self.slam_path_pub = self.create_publisher(Path, 'slam_path', 10)
         self.odom_path_pub = self.create_publisher(Path, 'odom_path', 10)
         self.local_pose_pub = self.create_publisher(PoseStamped, 'local_pose', 10)
         self.global_path_pub = self.create_publisher(Path, 'global_path', 10)
         self.global_pose_pub = self.create_publisher(PoseStamped, 'global_pose', 10)
+        self.map_pub = self.create_publisher(OccupancyGrid, '/map', 1)
     
 
         self.last_map_correction = np.eye(4)  # Last map->odom correction
@@ -85,10 +82,15 @@ class SlamNode(Node):
         self.odom_path_msg = Path()
         self.global_path_msg = Path()
 
+        # Create timer for occupancy grid publishing at 1Hz
+        self.map_timer = self.create_timer(1.0, self.publish_occupancy_grid)
+        
+        # Store the latest lidar message timestamp for map publishing
+        self.latest_lidar_timestamp = None
+
     def listener_callback(self, msg):
         """Fast odometry thread - processes scans and publishes odom->base_link transform"""
         # Extract points and timestamps from PointCloud2 message
-        st_time = time.time()
         points_np = pc2.read_points(msg, field_names=("x", "y", "z", "t"), skip_nans=True)
         timestamps = points_np['t'].astype(np.float64)
         points = np.vstack([points_np['x'], points_np['y'], points_np['z']]).T.astype(np.float64)
@@ -96,43 +98,31 @@ class SlamNode(Node):
         # Odometry processing (no threading)
         self.slam.process_scan(points, timestamps)
 
+        # Store the latest lidar timestamp for map publishing
+        self.latest_lidar_timestamp = msg.header.stamp
+
         # get the last corrected local pose (odom->base_link)
-        # current_odom_pose = self.slam.poses[-1]
         odom_T_base = self.slam.local_map_graph.last_local_map.local_trajectory[-1]
 
-        # get the keypose of the last local map keypose (it should be realtive the first local map) (map->odom)
-        map_T_odom = self.slam.get_keyposes()[-1] # the keuposes get corrected after optimization in case of loop closures
-
-
-        # Publish local map as PointCloud2 every 5 seconds
-        # local_map_in_global = transform_points(self.slam.voxel_grid.point_cloud(), current_node.keypose)
-        # if not hasattr(self, 'last_local_map_pub_time'):
-        #     self.last_local_map_pub_time = self.get_clock().now()
-        #     self.local_map_pub = self.create_publisher(PointCloud2, 'local_map_in_global', 1)
-
-        # now = self.get_clock().now()
-        # if (now - self.last_local_map_pub_time).nanoseconds >= 5 * 1e9:
-        #     local_map_points = local_map_in_global.astype(np.float32)
-        #     header = msg.header
-        #     header.frame_id = self.odom_frame
-        #     local_map_pc2 = pc2.create_cloud_xyz32(header, local_map_points)
-        #     self.local_map_pub.publish(local_map_pc2)
-        #     self.last_local_map_pub_time = now
-
+        # get the keypose of the last local map keypose (it should be relative to the first local map) (map->odom)
+        map_T_odom = self.slam.get_keyposes()[-1] 
+        
+        # Integrate scan into occupancy mapper using aligned pose
+        self.occupancy_mapper.integrate_frame(points, self.slam.poses[-1])
 
         # Create timestamp for this frame
-        current_time = self.get_clock().now().to_msg()
+        current_time = msg.header.stamp
         
         # Publish odom->base_link transform
         self._publish_odom_transform(odom_T_base, current_time)
 
-        # Publish map->odom transform
+        # Publish map->odom transform (using aligned transformation)
         self._publish_map_transform(map_T_odom, current_time)
         
         # Publish odometry pose and path
         self._publish_odometry_pose_and_path(odom_T_base, current_time)
 
-        # Publish global pose from map to base_link
+        # Publish global pose from map to base_link (using aligned transformation)
         self._publish_global_path(map_T_odom, odom_T_base, current_time)
         
         # Publish corrected SLAM path
@@ -237,6 +227,57 @@ class SlamNode(Node):
             slam_path_msg.poses.append(p)
         
         self.slam_path_pub.publish(slam_path_msg)
+
+    def publish_occupancy_grid(self):
+        """Publish 2D occupancy grid at 1Hz"""
+        try:
+            # Skip if no lidar data received yet
+            if self.latest_lidar_timestamp is None:
+                return
+                
+            # Compute occupancy information
+            self.occupancy_mapper.compute_3d_occupancy_information()
+            self.occupancy_mapper.compute_2d_occupancy_information()
+            
+            # Create OccupancyGrid message
+            occupancy_msg = OccupancyGrid()
+            occupancy_msg.header.stamp = self.latest_lidar_timestamp  # Use lidar timestamp
+            occupancy_msg.header.frame_id = self.map_frame
+            
+            # Set map metadata
+            occupancy_msg.info.resolution = self.occupancy_mapper.config.resolution
+            occupancy_msg.info.width = int(self.occupancy_mapper.occupancy_grid.shape[0])
+            occupancy_msg.info.height = int(self.occupancy_mapper.occupancy_grid.shape[1])
+            
+            occupancy_msg.info.origin.position.x = float(self.occupancy_mapper.lower_bound[0]) * self.occupancy_mapper.config.resolution
+            occupancy_msg.info.origin.position.y = float(self.occupancy_mapper.lower_bound[1]) * self.occupancy_mapper.config.resolution
+            occupancy_msg.info.origin.position.z = 0.0
+            occupancy_msg.info.origin.orientation.x = 0.0
+            occupancy_msg.info.origin.orientation.y = 0.0
+            occupancy_msg.info.origin.orientation.z = 0.0
+            occupancy_msg.info.origin.orientation.w = 1.0
+            
+            # Convert occupancy grid to ROS format
+            # The occupancy grid values are in [0, 1] where 0 = free, 1 = occupied
+            # ROS expects values in [0, 100] where 0 = free, 100 = occupied, -1 = unknown
+            occupancy_data = self.occupancy_mapper.occupancy_grid.T.copy()
+            occupancy_data = occupancy_data.flatten()
+            
+            # Vectorized conversion for ROS message
+            free = occupancy_data < self.occupancy_mapper.config.free_threshold
+            occupied = occupancy_data > self.occupancy_mapper.config.occupied_threshold
+            ros_occupancy_data = np.full_like(occupancy_data, -1, dtype=np.int8)
+            ros_occupancy_data[free] = 0
+            ros_occupancy_data[occupied] = 100
+            ros_occupancy_data = ros_occupancy_data.flatten().tolist()
+            
+            occupancy_msg.data = ros_occupancy_data
+            
+            # Publish the map
+            self.map_pub.publish(occupancy_msg)
+                
+        except Exception as e:
+            self.get_logger().warn(f'Failed to publish occupancy grid: {str(e)}')
 
     def destroy_node(self):
         """Clean shutdown"""

@@ -16,6 +16,9 @@ def generate_launch_description():
     topic = LaunchConfiguration("topic", default="/ouster/points")
     visualize = LaunchConfiguration("visualize", default="true")
     bagfile = LaunchConfiguration("bagfile", default="")
+    base_frame = LaunchConfiguration("base_frame", default="base_link")
+    odom_frame = LaunchConfiguration("odom_frame", default="odom")
+    map_frame = LaunchConfiguration("map_frame", default="map")
 
     # KISS-SLAM node
     slam_node = Node(
@@ -32,6 +35,9 @@ def generate_launch_description():
             ),
             {
                 "use_sim_time": use_sim_time,
+                "base_frame": base_frame,
+                "odom_frame": odom_frame,
+                "map_frame": map_frame,
             }
         ],
     )
@@ -52,7 +58,7 @@ def generate_launch_description():
 
     # Bag playback
     bagfile_play = ExecuteProcess(
-        cmd=["ros2", "bag", "play", "--rate", "1", bagfile, "--clock", "1000.0"],
+        cmd=["ros2", "bag", "play", "--rate", "2", bagfile, "--clock", "1000.0"],
         output="screen",
         condition=IfCondition(PythonExpression(["'", bagfile, "' != ''"])),
     )
@@ -64,9 +70,10 @@ def generate_launch_description():
             DeclareLaunchArgument("visualize", default_value="true"),
             DeclareLaunchArgument("bagfile", default_value=""),
             DeclareLaunchArgument("base_frame", default_value="base_link"),
-            DeclareLaunchArgument("odom_frame", default_value="odom_lidar"),
+            DeclareLaunchArgument("odom_frame", default_value="odom"),
+            DeclareLaunchArgument("map_frame", default_value="map"),
             slam_node,
-            rviz_node,
             bagfile_play,
+            rviz_node
         ]
     )
