@@ -91,6 +91,7 @@ ros2/build/
 ros2/install/
 ros2/log/
 ros2/tmp/
+ros2/maps/
 share/python-wheels/
 *.egg-info/
 .installed.cfg

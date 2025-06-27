@@ -52,7 +52,7 @@ def generate_launch_description():
     # Bag playback
     bagfile_play = ExecuteProcess(
         # --remap /j100_0819/tf:=/tf /j100_0819/tf_static:=/tf_static
-        cmd=["ros2", "bag", "play", "--rate", "1", bagfile, "--clock", "1000.0", "--remap", "/j100_0819/tf:=/tf", "--remap", "/j100_0819/tf_static:=/tf_static"],
+        cmd=["ros2", "bag", "play", "--rate", "2", bagfile, "--clock", "1000.0", "--remap", "/j100_0819/tf:=/tf", "--remap", "/j100_0819/tf_static:=/tf_static"],
         output="screen",
         condition=IfCondition(PythonExpression(["'", bagfile, "' != ''"])),
     )
@@ -66,13 +66,29 @@ def generate_launch_description():
             DeclareLaunchArgument("base_frame", default_value="base_link"),
             DeclareLaunchArgument("odom_frame", default_value="odom"),
             DeclareLaunchArgument("map_frame", default_value="map"),
-            DeclareLaunchArgument("save_final_map", default_value="false"),
-            DeclareLaunchArgument("map_save_directory", default_value="/tmp/kiss_slam_maps"),
-            DeclareLaunchArgument("save_2d_map", default_value="true"),
-            DeclareLaunchArgument("save_3d_map", default_value="true"),
+            DeclareLaunchArgument("save_final_map", default_value="true"),
+            DeclareLaunchArgument("map_save_directory", default_value="maps/map"),
+            DeclareLaunchArgument("map_save_interval",default_value="10.0"),
             slam_node,
             bagfile_play,
             rviz_node,
+            ExecuteProcess(
+                cmd=[
+                    "bash",
+                    "-c",
+                    [
+                        "while true; do mkdir -p $(dirname ",
+                        LaunchConfiguration("map_save_directory"),
+                        "); ros2 run nav2_map_server map_saver_cli -f ",
+                        LaunchConfiguration("map_save_directory"),
+                        "; sleep ",
+                        LaunchConfiguration("map_save_interval"),
+                        "; done",
+                    ],
+                ],
+                output="screen",
+                condition=IfCondition(LaunchConfiguration("save_final_map")),
+            ),
             RegisterEventHandler(
                 OnProcessExit(
                     target_action=bagfile_play,
