@@ -72,23 +72,23 @@ def generate_launch_description():
             slam_node,
             bagfile_play,
             rviz_node,
-            ExecuteProcess(
-                cmd=[
-                    "bash",
-                    "-c",
-                    [
-                        "while true; do mkdir -p $(dirname ",
-                        LaunchConfiguration("map_save_directory"),
-                        "); ros2 run nav2_map_server map_saver_cli -f ",
-                        LaunchConfiguration("map_save_directory"),
-                        "; sleep ",
-                        LaunchConfiguration("map_save_interval"),
-                        "; done",
-                    ],
-                ],
-                output="screen",
-                condition=IfCondition(LaunchConfiguration("save_final_map")),
-            ),
+            # ExecuteProcess(
+            #     cmd=[
+            #         "bash",
+            #         "-c",
+            #         [
+            #             "while true; do mkdir -p $(dirname ",
+            #             LaunchConfiguration("map_save_directory"),
+            #             "); ros2 run nav2_map_server map_saver_cli -f ",
+            #             LaunchConfiguration("map_save_directory"),
+            #             "; sleep ",
+            #             LaunchConfiguration("map_save_interval"),
+            #             "; done",
+            #         ],
+            #     ],
+            #     output="screen",
+            #     condition=IfCondition(LaunchConfiguration("save_final_map")),
+            # ),
             RegisterEventHandler(
                 OnProcessExit(
                     target_action=bagfile_play,

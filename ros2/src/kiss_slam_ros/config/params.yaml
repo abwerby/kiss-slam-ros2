@@ -5,10 +5,6 @@ slam_node:
     odom_frame: "odom"
     base_frame: "base_link"
     
-    # Threading parameters
-    loop_closure_threshold: 5  # Minimum number of local maps before triggering loop closure
-    optimization_frequency: 1.0  # Hz for periodic optimization
-
     # KISS-SLAM parameters
     kiss_slam:
       odometry:
@@ -35,7 +31,7 @@ slam_node:
       occupancy_mapper:
           free_threshold: 0.2
           occupied_threshold: 0.65
-          resolution: 0.1
+          resolution: 0.025
           max_range: -1.0  # -1.0 represents null
           z_min: 0.1
           z_max: 0.5
