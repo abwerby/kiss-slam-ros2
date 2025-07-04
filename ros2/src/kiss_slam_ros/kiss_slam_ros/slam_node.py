@@ -1,4 +1,5 @@
 import os
+import multiprocessing as mp
 import time
 import threading
 import queue
@@ -29,6 +30,35 @@ from kiss_slam_ros.utils.config import declare_parameters, get_kiss_slam_config
 
 # setup rclpy logging
 rclpy.logging.set_logger_level('kiss_slam_ros', rclpy.logging.LoggingSeverity.INFO)
+
+
+def map_generating_process(in_queue, results_queue, shutdown_evt):
+    """Process to generate occupancy maps from local maps"""
+    while not shutdown_evt.is_set():
+        st_time = time.time()
+        try:
+            # Wait for local maps to be available
+            in_data = in_queue.get()
+            local_maps = in_data['local_maps']
+            config = in_data['config']
+            poses = in_data['poses']
+            rclpy.logging.get_logger('kiss_slam_ros').info(
+                f'Received {len(local_maps)} local maps for occupancy grid generation'
+                f'Received {len(poses)} poses for occupancy grid generation'
+            )
+            occupancy_mapper = OccupancyGridMapper(config.occupancy_mapper)
+            for i, map in enumerate(local_maps):
+                occupancy_mapper.integrate_frame(map, poses[i])
+            occupancy_mapper.compute_3d_occupancy_information()
+            occupancy_mapper.compute_2d_occupancy_information()
+            results_queue.put({
+                'occupancy_grid': occupancy_mapper.occupancy_grid,
+                'occupancy_grid_config': occupancy_mapper.config,
+                'occupancy_grid_lower_bound': occupancy_mapper.lower_bound
+            })
+        except Exception as e:
+            rclpy.logging.get_logger('kiss_slam_ros').error(f'Error in map generating process: {e}')
+
 
 # Data structure for thread communication
 class ScanData:
@@ -73,18 +103,33 @@ class SlamNode(Node):
         # Initialize core SLAM components
         self.odometry = KissICP(config.kiss_icp_config())
         self.slam = KissSLAM(config)
-        self.occupancy_mapper = OccupancyGridMapper(config.occupancy_mapper)
         self.slam_config = config  # Store config for later use
         
-        # Threading setup
-        self.scan_queue = queue.Queue(maxsize=10)  # Limit queue size to prevent memory issues
+        # Threading setup for slam processing
+        self.scan_queue = queue.Queue(maxsize=5)  # Limit queue size to prevent memory issues
         self.slam_thread = None
         self.shutdown_event = threading.Event()
+
+        # multiprocessing setup for map generation
+        self.in_queue    = mp.Queue(maxsize=5)
+        self.results_queue = mp.Queue(maxsize=5)
+        self.map_process = mp.Process(
+            target=map_generating_process,
+            args=(
+                self.in_queue,
+                self.results_queue,
+                self.shutdown_event
+            ),
+            daemon=True
+        )
+        self.map_process.start()
         
         # Thread-safe data sharing
         self._poses_lock = threading.Lock()
         self._current_keyposes = []
         self._current_poses = []
+        self.local_maps = []
+        self.poses = None
         
         # Start SLAM processing thread
         self.slam_thread = threading.Thread(target=self._slam_processing_thread, daemon=True)
@@ -105,6 +150,7 @@ class SlamNode(Node):
         )
         self.map_pub = self.create_publisher(OccupancyGrid, '/map', map_qos)
     
+        self.map_publish_timer = self.create_timer(1.0, self._publish_map_if_available)
 
         self.last_map_correction = np.eye(4)  # Last map->odom correction
         self.corrected_poses = []  # Store corrected poses after optimization
@@ -148,7 +194,7 @@ class SlamNode(Node):
             deskewed_frame=deskewed_frame,
         )
         try:
-            self.scan_queue.put(scan_data, timeout=1.0)  # Block until space is available
+            self.scan_queue.put(scan_data, timeout=0.1)  # Block until space is available
         except queue.Full:
             rclpy.logging.get_logger('kiss_slam_ros').warn(
                 'Scan queue is full, dropping scan data'
@@ -197,7 +243,6 @@ class SlamNode(Node):
                 self.slam.local_map_graph.last_local_map.local_trajectory.append(scan.current_pose)
 
                 # 4) if it’s time for a new node…
-                poses = None
                 if traveled > self.slam.local_map_splitting_distance:
                     # a) get points of the current local map
                     points = self.odometry.local_map.point_cloud()
@@ -222,14 +267,21 @@ class SlamNode(Node):
                         self.slam.local_map_graph.last_id, query_id, relative_motion, np.eye(6)
                     )
                     self.slam.compute_closures(query_id, query_points)
+                    # self.poses, _ = self.slam.fine_grained_optimization()
 
-                    poses, _ = self.slam.fine_grained_optimization()
-
+                # 5) push data to mapping process
+                self.local_maps.append(mapping_frame)
+                if self.in_queue.empty():
+                    self.in_queue.put({
+                        'local_maps': self.local_maps,
+                        'config': self.slam_config,
+                        'poses': self.slam.poses
+                    })
 
                 # Update thread-safe poses
                 with self._poses_lock:
                     self._current_keyposes = self.slam.get_keyposes()
-                    self._current_poses = poses if poses is not None else self.slam.poses
+                    self._current_poses = self.poses if self.poses is not None else self.slam.poses
 
                 self.scan_queue.task_done()
 
@@ -240,9 +292,6 @@ class SlamNode(Node):
                 continue
 
         log.info('SLAM processing thread stopped')
-
-
-
 
     def _publish_odom_transform(self, odom_pose, timestamp):
         """Publish odom->base_link transform"""
@@ -347,16 +396,17 @@ class SlamNode(Node):
         
         self.slam_path_pub.publish(slam_path_msg)
 
-    def publish_occupancy_grid(self):
-        """Publish 2D occupancy grid at 1Hz"""
+    def _publish_map_if_available(self):
+        """Publish 2D occupancy grid at 1Hz if available"""
         try:
+            if self.results_queue.empty():
+                return
+
             # Skip if no lidar data received yet
             if self.latest_lidar_timestamp is None:
                 return
-                
-            # Compute occupancy information
-            self.occupancy_mapper.compute_3d_occupancy_information()
-            self.occupancy_mapper.compute_2d_occupancy_information()
+            
+            map_data = self.results_queue.get_nowait()
             
             # Create OccupancyGrid message
             occupancy_msg = OccupancyGrid()
@@ -364,12 +414,12 @@ class SlamNode(Node):
             occupancy_msg.header.frame_id = self.map_frame
             
             # Set map metadata
-            occupancy_msg.info.resolution = self.occupancy_mapper.config.resolution
-            occupancy_msg.info.width = int(self.occupancy_mapper.occupancy_grid.shape[0])
-            occupancy_msg.info.height = int(self.occupancy_mapper.occupancy_grid.shape[1])
+            occupancy_msg.info.resolution = map_data['occupancy_grid_config'].resolution
+            occupancy_msg.info.width = int(map_data['occupancy_grid'].shape[0])
+            occupancy_msg.info.height = int(map_data['occupancy_grid'].shape[1])
             
-            occupancy_msg.info.origin.position.x = float(self.occupancy_mapper.lower_bound[0]) * self.occupancy_mapper.config.resolution
-            occupancy_msg.info.origin.position.y = float(self.occupancy_mapper.lower_bound[1]) * self.occupancy_mapper.config.resolution
+            occupancy_msg.info.origin.position.x = float(map_data['occupancy_grid_lower_bound'][0]) * map_data['occupancy_grid_config'].resolution
+            occupancy_msg.info.origin.position.y = float(map_data['occupancy_grid_lower_bound'][1]) * map_data['occupancy_grid_config'].resolution
             occupancy_msg.info.origin.position.z = 0.0
             occupancy_msg.info.origin.orientation.x = 0.0
             occupancy_msg.info.origin.orientation.y = 0.0
@@ -377,17 +427,15 @@ class SlamNode(Node):
             occupancy_msg.info.origin.orientation.w = 1.0
             
             # Convert occupancy grid to ROS format
-            # The occupancy grid values are in [0, 1] where 0 = free, 1 = occupied
-            # ROS expects values in [0, 100] where 0 = free, 100 = occupied, -1 = unknown
-            occupancy_data = self.occupancy_mapper.occupancy_grid.T.copy()
+            occupancy_data = map_data['occupancy_grid'].T.copy()
             occupancy_data = occupancy_data.flatten()
             
             # Vectorized conversion for ROS message
-            free = occupancy_data < self.occupancy_mapper.config.free_threshold
-            occupied = occupancy_data > self.occupancy_mapper.config.occupied_threshold
+            free = occupancy_data < map_data['occupancy_grid_config'].free_threshold
+            occupied = occupancy_data > map_data['occupancy_grid_config'].occupied_threshold
             ros_occupancy_data = np.full_like(occupancy_data, -1, dtype=np.int8)
-            ros_occupancy_data[free] = 0
-            ros_occupancy_data[occupied] = 100
+            ros_occupancy_data[free] = 100
+            ros_occupancy_data[occupied] = 0
             ros_occupancy_data = ros_occupancy_data.flatten().tolist()
             
             occupancy_msg.data = ros_occupancy_data
@@ -395,6 +443,8 @@ class SlamNode(Node):
             # Publish the map
             self.map_pub.publish(occupancy_msg)
                 
+        except queue.Empty:
+            pass
         except Exception as e:
             self.get_logger().warn(f'Failed to publish occupancy grid: {str(e)}')
 
