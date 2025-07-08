@@ -1,479 +1,390 @@
-import os
-import multiprocessing as mp
+import rclpy
+import numpy as np
+import message_filters
 import time
-import threading
-import queue
-from pathlib import Path
-from typing import List, Tuple
-from datetime import datetime
-from map_closures import map_closures
-from tqdm import tqdm, trange
-from kiss_icp.kiss_icp import KissICP
-from kiss_icp.voxelization import voxel_down_sample
+import functools
 
 from scipy.spatial.transform import Rotation as R
-import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from sensor_msgs.msg import PointCloud2 
-from geometry_msgs.msg import PoseStamped, TransformStamped
-from sensor_msgs_py import point_cloud2 as pc2
 
+from sensor_msgs.msg import PointCloud2
+from geometry_msgs.msg import PoseStamped, TransformStamped
 from nav_msgs.msg import Path, OccupancyGrid
+import std_msgs.msg
+from sensor_msgs_py import point_cloud2 as pc2
 import tf2_ros
-import numpy as np
-from kiss_slam.slam import KissSLAM, transform_points
+from rclpy.callback_groups import ReentrantCallbackGroup, MutuallyExclusiveCallbackGroup
+import open3d as o3d
+from kiss_icp.voxelization import voxel_down_sample
+from kiss_slam.local_map_graph import LocalMapGraph
 from kiss_slam.occupancy_mapper import OccupancyGridMapper
+from kiss_slam.loop_closer import LoopCloser
+from kiss_slam.pose_graph_optimizer import PoseGraphOptimizer
 from kiss_slam.voxel_map import VoxelMap
+
 from kiss_slam_ros.utils.config import declare_parameters, get_kiss_slam_config
 
 
-# setup rclpy logging
-rclpy.logging.set_logger_level('kiss_slam_ros', rclpy.logging.LoggingSeverity.INFO)
+# TODO: this should be moved to a separate utility module
+def timing_decorator(func):
+    """Decorator to measure and log function execution time."""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        start_time = time.time()
+        result = func(*args, **kwargs)
+        execution_time = time.time() - start_time
+        
+        # If called from a ROS node, use the node's logger
+        if args and hasattr(args[0], 'get_logger') and callable(args[0].get_logger):
+            args[0].get_logger().info(f"{func.__name__} executed in {execution_time:.4f} seconds")
+        else:
+            print(f"{func.__name__} executed in {execution_time:.4f} seconds")
+            
+        return result
+    return wrapper
 
-
-def map_generating_process(in_queue, results_queue, shutdown_evt):
-    """Process to generate occupancy maps from local maps"""
-    while not shutdown_evt.is_set():
-        st_time = time.time()
-        try:
-            # Wait for local maps to be available
-            in_data = in_queue.get()
-            local_maps = in_data['local_maps']
-            config = in_data['config']
-            poses = in_data['poses']
-            rclpy.logging.get_logger('kiss_slam_ros').info(
-                f'Received {len(local_maps)} local maps for occupancy grid generation'
-                f'Received {len(poses)} poses for occupancy grid generation'
-            )
-            occupancy_mapper = OccupancyGridMapper(config.occupancy_mapper)
-            for i, map in enumerate(local_maps):
-                occupancy_mapper.integrate_frame(map, poses[i])
-            occupancy_mapper.compute_3d_occupancy_information()
-            occupancy_mapper.compute_2d_occupancy_information()
-            results_queue.put({
-                'occupancy_grid': occupancy_mapper.occupancy_grid,
-                'occupancy_grid_config': occupancy_mapper.config,
-                'occupancy_grid_lower_bound': occupancy_mapper.lower_bound
-            })
-        except Exception as e:
-            rclpy.logging.get_logger('kiss_slam_ros').error(f'Error in map generating process: {e}')
-
-
-# Data structure for thread communication
-class ScanData:
-    def __init__(self, points, timestamps, current_pose, deskewed_frame):
-        self.points = points.copy()  # Ensure points are copied to avoid threading issues
-        self.timestamps = timestamps.copy()  # Copy timestamps to avoid threading issues
-        self.current_pose = current_pose.copy()  # Copy current pose to avoid threading issues
-        self.deskewed_frame = deskewed_frame.copy()  # Copy deskewed frame to avoid threading issues
-
-class SlamNode(Node):
+class SLAMNode(Node):
     def __init__(self):
         super().__init__('slam_node')
 
-        # Declare parameters
+        # Parameters
         declare_parameters(self)
+        self.map_frame = self.get_parameter('map_frame').value
+        self.odom_frame = self.get_parameter('odom_frame').value
+        self.config = get_kiss_slam_config(self)
         
-        # Get parameters
-        self.map_frame = self.get_parameter('map_frame').get_parameter_value().string_value
-        self.odom_frame = self.get_parameter('odom_frame').get_parameter_value().string_value
-        self.base_frame = self.get_parameter('base_frame').get_parameter_value().string_value
-        self.loop_closure_threshold = self.get_parameter('loop_closure_threshold').get_parameter_value().integer_value
-        self.optimization_frequency = self.get_parameter('optimization_frequency').get_parameter_value().double_value
+        # Core SLAM Backend
+        self.closer = LoopCloser(self.config.loop_closer)
+        local_map_config = self.config.local_mapper
+        self.local_map_voxel_size = local_map_config.voxel_size
+        self.voxel_grid = VoxelMap(self.local_map_voxel_size)
+        self.local_map_graph = LocalMapGraph()
+        self.local_map_splitting_distance = local_map_config.splitting_distance
+        self.optimizer = PoseGraphOptimizer(self.config.pose_graph_optimizer)
+        self.closures = []
 
-        # Build KISS-SLAM config
-        config = get_kiss_slam_config(self)
-        
-        # log all config parameters
-        rclpy.logging.get_logger('kiss_slam_ros').info(
+        # state variables
+        self.local_maps = []  # List to store local maps
+        self.voxel_maps = []  # List to store voxel maps
+
+        # ROS Communications
+        self.fast_callback_group = ReentrantCallbackGroup()
+        self.slow_callback_group = MutuallyExclusiveCallbackGroup()
+        self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
+        self._init_publishers()
+        self._init_subscribers()
+
+        self.get_logger().info(
             f'KISS-SLAM configuration:\n'
             f'  Map Frame: {self.map_frame}\n'
             f'  Odometry Frame: {self.odom_frame}\n'
-            f'  Base Frame: {self.base_frame}\n'
-            f'  Loop Closure Threshold: {self.loop_closure_threshold}\n'
-            f'  Optimization Frequency: {self.optimization_frequency}\n'
-            f'  Odometry Config: {config.odometry}\n'
-            f'  Local Mapper Config: {config.local_mapper}\n'
-            f'  Occupancy Mapper Config: {config.occupancy_mapper}\n'
-            f'  Loop Closer Config: {config.loop_closer}\n'
-            f'  Pose Graph Optimizer Config: {config.pose_graph_optimizer}\n'
+            f'  Odometry Config: {self.config.odometry}\n'
+            f'  Local Mapper Config: {self.config.local_mapper}\n'
+            f'  Occupancy Mapper Config: {self.config.occupancy_mapper}\n'
+            f'  Loop Closer Config: {self.config.loop_closer}\n'
+            f'  Pose Graph Optimizer Config: {self.config.pose_graph_optimizer}\n'
         )
+        
+        self.get_logger().info("SLAM node initialized and waiting for keyframes.")
 
-        # Initialize core SLAM components
-        self.odometry = KissICP(config.kiss_icp_config())
-        self.slam = KissSLAM(config)
-        self.slam_config = config  # Store config for later use
-        
-        # Threading setup for slam processing
-        self.scan_queue = queue.Queue(maxsize=5)  # Limit queue size to prevent memory issues
-        self.slam_thread = None
-        self.shutdown_event = threading.Event()
-
-        # multiprocessing setup for map generation
-        self.in_queue    = mp.Queue(maxsize=5)
-        self.results_queue = mp.Queue(maxsize=5)
-        self.map_process = mp.Process(
-            target=map_generating_process,
-            args=(
-                self.in_queue,
-                self.results_queue,
-                self.shutdown_event
-            ),
-            daemon=True
-        )
-        self.map_process.start()
-        
-        # Thread-safe data sharing
-        self._poses_lock = threading.Lock()
-        self._current_keyposes = []
-        self._current_poses = []
-        self.local_maps = []
-        self.poses = None
-        
-        # Start SLAM processing thread
-        self.slam_thread = threading.Thread(target=self._slam_processing_thread, daemon=True)
-        self.slam_thread.start()
-        
-        self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
-        self.slam_path_pub = self.create_publisher(Path, 'slam_path', 10)
-        self.odom_path_pub = self.create_publisher(Path, 'odom_path', 10)
-        self.local_pose_pub = self.create_publisher(PoseStamped, 'local_pose', 10)
-        self.global_path_pub = self.create_publisher(Path, 'global_path', 10)
-        self.global_pose_pub = self.create_publisher(PoseStamped, 'global_pose', 10)
-        
-        map_qos = QoSProfile(
-            reliability=ReliabilityPolicy.RELIABLE,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL
-        )
+    def _init_publishers(self):
+        """Initialize all ROS publishers."""
+        map_qos = QoSProfile(durability=DurabilityPolicy.TRANSIENT_LOCAL, reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST, depth=1)
+        path_qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST, depth=10)
+        self.slam_path_pub = self.create_publisher(Path, '/slam_path', path_qos)
         self.map_pub = self.create_publisher(OccupancyGrid, '/map', map_qos)
-    
-        self.map_publish_timer = self.create_timer(1.0, self._publish_map_if_available)
+        self.global_voxel_map_pub = self.create_publisher(PointCloud2, '/global_voxel_map', 10)
+        # self.create_timer(2.0, self.publish_2D_map, callback_group=self.slow_callback_group)  # Publish map every 2 seconds
+        self.create_timer(0.5, self.publish_slam_path, callback_group=self.slow_callback_group)
 
-        self.last_map_correction = np.eye(4)  # Last map->odom correction
-        self.corrected_poses = []  # Store corrected poses after optimization
-        self.pose_corrections_available = False
+    def _init_subscribers(self):
+        """Initialize message_filters subscribers to synchronize keyframe data."""
+        # Subscribe to the local map and the corresponding odometry pose
+        deskewed_points_sub = message_filters.Subscriber(self, PointCloud2, '/deskewed_points')
+        local_map_sub = message_filters.Subscriber(self, PointCloud2, '/local_map')
+        odom_pose_sub = message_filters.Subscriber(self, PoseStamped, '/odom_pose')
 
-        qos_profile = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=10,
-            durability=DurabilityPolicy.VOLATILE
-        )
+        # Synchronize the topics by timestamp
+        self.ts = message_filters.TimeSynchronizer([deskewed_points_sub, odom_pose_sub, local_map_sub], 10)
+        self.ts.registerCallback(self.keyframe_callback)
 
-        self.subscription = self.create_subscription(
-            PointCloud2,
-            '/points_raw',
-            self.listener_callback,
-            qos_profile)
+    def keyframe_callback(self, deskewed_points_msg: PointCloud2, odom_pose_msg: PoseStamped, local_map_msg: PointCloud2):
+        """
+        This callback is triggered only when a synchronized pair of deskewed_points and odom_pose messages arrives.
+        """
+        stamp = odom_pose_msg.header.stamp
+        # self.get_logger().info(f"Synchronized keyframe received for timestamp {stamp.sec}.{stamp.nanosec}")
+
+        # 1. Extract data from messages
+        points_np = pc2.read_points(deskewed_points_msg, field_names=("x", "y", "z"), skip_nans=True)
+        keyframe_points = np.vstack([points_np['x'], points_np['y'], points_np['z']]).T.astype(np.float64)
+        current_keyframe_pose = self._msg_to_pose(odom_pose_msg.pose)
+        points_np_local_map = pc2.read_points(local_map_msg, field_names=("x", "y", "z"), skip_nans=True)
+        local_map_points = np.vstack([points_np_local_map['x'], points_np_local_map['y'], points_np_local_map['z']]).T.astype(np.float64)
         
-        self.odom_path_msg = Path()
-        self.global_path_msg = Path()
-        
-        # Store the latest lidar message timestamp for map publishing
-        self.latest_lidar_timestamp = None
+        # 2. update voxel grid and local map graph
+        mapping_frame = voxel_down_sample(keyframe_points, self.local_map_voxel_size)
+        self.voxel_grid.integrate_frame(mapping_frame, current_keyframe_pose)
+        self.local_map_graph.last_local_map.local_trajectory.append(current_keyframe_pose)
 
-    def listener_callback(self, msg):
-        """Fast odometry thread - processes scans and publishes odom->base_link transform"""
-        # Extract points and timestamps from PointCloud2 message
-        points_np = pc2.read_points(msg, field_names=("x", "y", "z", "t"), skip_nans=True)
-        timestamps = points_np['t'].astype(np.float64)
-        points = np.vstack([points_np['x'], points_np['y'], points_np['z']]).T.astype(np.float64)
-
-        # Odometry processing (main thread - fast and real-time)
-        deskewed_frame, _ = self.odometry.register_frame(points, timestamps)
-        current_pose = self.odometry.last_pose
-        
-        # Prepare data for mapping (in background thread)
-        scan_data = ScanData(
-            points=points,
-            timestamps=timestamps,
-            current_pose=current_pose,
-            deskewed_frame=deskewed_frame,
-        )
-        try:
-            self.scan_queue.put(scan_data, timeout=0.1)  # Block until space is available
-        except queue.Full:
-            rclpy.logging.get_logger('kiss_slam_ros').warn(
-                'Scan queue is full, dropping scan data'
+        if np.linalg.norm(current_keyframe_pose[:3, -1]) > self.local_map_splitting_distance:
+            last_local_map = self.local_map_graph.last_local_map
+            query_id = last_local_map.id
+            query_points = self.voxel_grid.point_cloud()
+            self.voxel_maps.append(self.voxel_grid.open3d_pcd_with_normals())
+            self.local_map_graph.finalize_local_map(self.voxel_grid)
+            self.local_maps.append(local_map_points)
+            self.voxel_grid.clear()
+            self.voxel_grid.add_points(local_map_points)
+            self.optimizer.add_variable(self.local_map_graph.last_id, self.local_map_graph.last_keypose)
+            self.optimizer.add_factor(
+                self.local_map_graph.last_id, query_id, last_local_map.local_trajectory[-1], np.eye(6)
             )
-        # Store the latest lidar timestamp for map publishing
-        self.latest_lidar_timestamp = msg.header.stamp
+            self._compute_closures(query_id, query_points)
+            gmap = self._create_global_voxel_map()
+            self.publish_pc2(gmap, frame_id=self.map_frame, stamp=stamp)  # Publish the global voxel map
+            # pcd = self._transform_points(query_points, self.get_keyposes()[-2])
+            # self.publish_pc2(pcd, frame_id=self.map_frame, stamp=stamp)  # Publish the global voxel map
+            # self.publish_2D_map()  # Publish the 2D map after each local map is finalized
+            # self.poses, _ = self._fine_grained_optimization()
 
-        # Create timestamp for this frame
-        current_time = msg.header.stamp
-        
-        # Publish odom->base_link transform
-        self._publish_odom_transform(current_pose, current_time)
+        # self.get_logger().info(
+        #     f"Number of voxel maps: {len(self.voxel_maps)}, Last voxel map size: {len(self.voxel_maps[-1]) if self.voxel_maps else 0}, "
+        #     f"Number of local maps: {len(self.local_maps)}, Last local map size: {len(self.local_maps[-1]) if self.local_maps else 0}"
+        # )
 
-        map_T_odom = self._current_keyposes[-1] if len(self._current_keyposes) > 0 else np.eye(4)
-        # Publish map->odom transform (using aligned transformation)
-        self._publish_map_transform(map_T_odom, current_time)
-        
-        # Publish odometry pose and path
-        self._publish_odometry_pose_and_path(current_pose, current_time)
+        # 3. Update and publish the map->odom transform and SLAM path
+        self._publish_transform(self.get_keyposes()[-1], stamp, self.map_frame, self.odom_frame)
 
-        # Publish global pose from map to base_link (using aligned transformation)
-        self._publish_global_path(map_T_odom, current_pose, current_time)
-        
-        # Publish corrected SLAM path (using thread-safe poses)
-        self._publish_slam_path(current_time)
+    def _msg_to_pose(self, pose_msg) -> np.ndarray:
+        """Convert a geometry_msgs/Pose to a 4x4 numpy array."""
+        p = pose_msg.position
+        o = pose_msg.orientation
+        pose = np.eye(4)
+        pose[:3, 3] = [p.x, p.y, p.z]
+        pose[:3, :3] = R.from_quat([o.x, o.y, o.z, o.w]).as_matrix()
+        return pose
 
+    def _publish_transform(self, pose: np.ndarray, stamp, frame_id: str, child_frame_id: str):
+        t = TransformStamped()
+        t.header.stamp, t.header.frame_id, t.child_frame_id = stamp, frame_id, child_frame_id
+        t.transform.translation.x, t.transform.translation.y, t.transform.translation.z = pose[0, 3], pose[1, 3], pose[2, 3]
+        q = R.from_matrix(pose[:3, :3]).as_quat()
+        t.transform.rotation.x, t.transform.rotation.y, t.transform.rotation.z, t.transform.rotation.w = q[0], q[1], q[2], q[3]
+        self.tf_broadcaster.sendTransform(t)
 
-    def _slam_processing_thread(self):
-        """Background thread for SLAM processing (loop closure and optimization)"""
-        log = rclpy.logging.get_logger('kiss_slam_ros')
-        log.info('SLAM processing thread started')
-
-        while not self.shutdown_event.is_set():
-            try:
-                scan = self.scan_queue.get(timeout=1.0)
-
-                # 1) voxelize
-                voxel_size = self.slam.local_map_voxel_size
-                mapping_frame = voxel_down_sample(scan.deskewed_frame, voxel_size)
-
-                # 2) traveled distance (from origin)
-                traveled = np.linalg.norm(scan.current_pose[:3, -1])
-
-                # 3) integrate into the map
-                self.slam.voxel_grid.integrate_frame(mapping_frame, scan.current_pose)
-                self.slam.local_map_graph.last_local_map.local_trajectory.append(scan.current_pose)
-
-                # 4) if it’s time for a new node…
-                if traveled > self.slam.local_map_splitting_distance:
-                    # a) get points of the current local map
-                    points = self.odometry.local_map.point_cloud()
-                    # b) reset odometry
-                    last_local_map = self.slam.local_map_graph.last_local_map
-                    relative_motion = last_local_map.local_trajectory[-1]
-                    inverse_relative_motion = np.linalg.inv(relative_motion)
-                    transformed_local_map = transform_points(points, inverse_relative_motion)
-
-                    self.odometry.local_map.clear()
-                    self.odometry.local_map.add_points(transformed_local_map)
-                    self.odometry.last_pose = np.eye(4)
-
-                    # c) calculate closures
-                    query_id = last_local_map.id
-                    query_points = self.slam.voxel_grid.point_cloud()
-                    self.slam.local_map_graph.finalize_local_map(self.slam.voxel_grid)
-                    self.slam.voxel_grid.clear()
-                    self.slam.voxel_grid.add_points(transformed_local_map)
-                    self.slam.optimizer.add_variable(self.slam.local_map_graph.last_id, self.slam.local_map_graph.last_keypose)
-                    self.slam.optimizer.add_factor(
-                        self.slam.local_map_graph.last_id, query_id, relative_motion, np.eye(6)
-                    )
-                    self.slam.compute_closures(query_id, query_points)
-                    # self.poses, _ = self.slam.fine_grained_optimization()
-
-                # 5) push data to mapping process
-                self.local_maps.append(mapping_frame)
-                if self.in_queue.empty():
-                    self.in_queue.put({
-                        'local_maps': self.local_maps,
-                        'config': self.slam_config,
-                        'poses': self.slam.poses
-                    })
-
-                # Update thread-safe poses
-                with self._poses_lock:
-                    self._current_keyposes = self.slam.get_keyposes()
-                    self._current_poses = self.poses if self.poses is not None else self.slam.poses
-
-                self.scan_queue.task_done()
-
-            except queue.Empty:
-                continue
-            except Exception as e:
-                log.error(f'Error in SLAM processing thread: {e}')
-                continue
-
-        log.info('SLAM processing thread stopped')
-
-    def _publish_odom_transform(self, odom_pose, timestamp):
-        """Publish odom->base_link transform"""
-        t_odom_base = TransformStamped()
-        t_odom_base.header.stamp = timestamp
-        t_odom_base.header.frame_id = self.odom_frame
-        t_odom_base.child_frame_id = self.base_frame
-        t_odom_base.transform.translation.x = odom_pose[0, 3]
-        t_odom_base.transform.translation.y = odom_pose[1, 3]
-        t_odom_base.transform.translation.z = odom_pose[2, 3]
-        q_odom_base = R.from_matrix(odom_pose[:3, :3]).as_quat()
-        t_odom_base.transform.rotation.x = q_odom_base[0]
-        t_odom_base.transform.rotation.y = q_odom_base[1]
-        t_odom_base.transform.rotation.z = q_odom_base[2]
-        t_odom_base.transform.rotation.w = q_odom_base[3]
-        
-        self.tf_broadcaster.sendTransform(t_odom_base)
-
-    def _publish_map_transform(self, last_keypose, timestamp):
-        """Publish map->odom transform using last local map keypose"""
-        t_map_odom = TransformStamped()
-        t_map_odom.header.stamp = timestamp
-        t_map_odom.header.frame_id = self.map_frame
-        t_map_odom.child_frame_id = self.odom_frame
-        t_map_odom.transform.translation.x = last_keypose[0, 3]
-        t_map_odom.transform.translation.y = last_keypose[1, 3]
-        t_map_odom.transform.translation.z = last_keypose[2, 3]
-        q_map_odom = R.from_matrix(last_keypose[:3, :3]).as_quat()
-        t_map_odom.transform.rotation.x = q_map_odom[0]
-        t_map_odom.transform.rotation.y = q_map_odom[1]
-        t_map_odom.transform.rotation.z = q_map_odom[2]
-        t_map_odom.transform.rotation.w = q_map_odom[3]
-        
-        self.tf_broadcaster.sendTransform(t_map_odom)
-
-    def _publish_odometry_pose_and_path(self, odom_pose, timestamp):
-        """Publish odometry pose and path"""
-        # Publish odometry pose
-        pose_msg = PoseStamped()
-        pose_msg.header.stamp = timestamp
-        pose_msg.header.frame_id = self.odom_frame
-        pose_msg.pose.position.x = odom_pose[0, 3]
-        pose_msg.pose.position.y = odom_pose[1, 3]
-        pose_msg.pose.position.z = odom_pose[2, 3]
-        q_odom = R.from_matrix(odom_pose[:3, :3]).as_quat()
-        pose_msg.pose.orientation.x = q_odom[0]
-        pose_msg.pose.orientation.y = q_odom[1]
-        pose_msg.pose.orientation.z = q_odom[2]
-        pose_msg.pose.orientation.w = q_odom[3]
-        self.local_pose_pub.publish(pose_msg)
-
-        # Publish odometry path
-        self.odom_path_msg.header.stamp = timestamp
-        self.odom_path_msg.header.frame_id = self.odom_frame
-        self.odom_path_msg.poses.append(pose_msg)
-        self.odom_path_pub.publish(self.odom_path_msg)
-    
-    def _publish_global_path(self, map_T_odom, odom_T_base, timestamp):
-        """Publish global pose from map to base_link using the odom pose"""
-        pose_msg = PoseStamped()
-        pose_msg.header.stamp = timestamp
-        pose_msg.header.frame_id = self.map_frame
-        map_T_base = map_T_odom @ odom_T_base
-        pose_msg.pose.position.x = map_T_base[0, 3]
-        pose_msg.pose.position.y = map_T_base[1, 3]
-        pose_msg.pose.position.z = map_T_base[2, 3]
-        q_map_base = R.from_matrix(map_T_base[:3, :3]).as_quat()
-        pose_msg.pose.orientation.x = q_map_base[0]
-        pose_msg.pose.orientation.y = q_map_base[1]
-        pose_msg.pose.orientation.z = q_map_base[2]
-        pose_msg.pose.orientation.w = q_map_base[3]
-        self.global_pose_pub.publish(pose_msg)
-
-        # Publish global path using the class variable to accumulate poses
-        self.global_path_msg.header.stamp = timestamp
-        self.global_path_msg.header.frame_id = self.map_frame
-        self.global_path_msg.poses.append(pose_msg)
-        self.global_path_pub.publish(self.global_path_msg)
-
-    def _publish_slam_path(self, timestamp):
-        """Publish globally corrected SLAM path using thread-safe poses"""
-        slam_path_msg = Path()
-        slam_path_msg.header.stamp = timestamp
-        slam_path_msg.header.frame_id = self.map_frame
-        
-        # Get poses in thread-safe manner
-        with self._poses_lock:
-            poses_copy = self._current_poses.copy() if self._current_poses else []
-        
-        for pose in poses_copy:
+    def _poses_to_path_msg(self, poses, stamp=None, frame_id=None):
+        """Convert the current poses to a Path message."""
+        path = Path()
+        path.header.stamp = stamp if stamp is not None else self.get_clock().now().to_msg()
+        path.header.frame_id = frame_id if frame_id is not None else self.map_frame
+        for pose_np in poses:
             p = PoseStamped()
-            p.header = slam_path_msg.header
-            p.pose.position.x = pose[0, 3]
-            p.pose.position.y = pose[1, 3]
-            p.pose.position.z = pose[2, 3]
-            q = R.from_matrix(pose[:3, :3]).as_quat()
-            p.pose.orientation.x = q[0]
-            p.pose.orientation.y = q[1]
-            p.pose.orientation.z = q[2]
-            p.pose.orientation.w = q[3]
-            slam_path_msg.poses.append(p)
+            p.header.stamp, p.header.frame_id = stamp, frame_id
+            p.pose.position.x, p.pose.position.y, p.pose.position.z = pose_np[0, 3], pose_np[1, 3], pose_np[2, 3]
+            q = R.from_matrix(pose_np[:3, :3]).as_quat()
+            p.pose.orientation.x, p.pose.orientation.y, p.pose.orientation.z, p.pose.orientation.w = q[0], q[1], q[2], q[3]
+            path.poses.append(p)
+        return path
+
+    def publish_slam_path(self):
+        """Publish the SLAM path as a Path message."""
+        path_msg = self._poses_to_path_msg(self.poses, stamp=self.get_clock().now().to_msg(), frame_id=self.map_frame)
+        self.slam_path_pub.publish(path_msg)
+
+    def _transform_points(self, pcd, T):
+        R = T[:3, :3]
+        t = T[:3, -1]
+        return pcd @ R.T + t
+    
+    def _compute_closures(self, query_id, query):
+        is_good, source_id, target_id, pose_constraint = self.closer.compute(
+            query_id, query, self.local_map_graph
+        )
+        if is_good:
+            self.closures.append((source_id, target_id))
+            self.optimizer.add_factor(source_id, target_id, pose_constraint, np.eye(6))
+            self._optimize_pose_graph()
+    
+    def _optimize_pose_graph(self):
+        self.optimizer.optimize()
+        estimates = self.optimizer.estimates()
+        for id_, pose in estimates.items():
+            self.local_map_graph[id_].keypose = np.copy(pose)
+
+    @timing_decorator
+    def publish_pc2(self, points, frame_id=None, stamp=None):
+        """Publish the points as a PointCloud2 message."""
+        # Handle different input types
+        if hasattr(points, 'point'):
+            # Tensor-based PointCloud
+            points_array = points.point.positions.cpu().numpy()
+        elif hasattr(points, 'points'):
+            # Legacy PointCloud
+            points_array = np.asarray(points.points)
+        else:
+            # Numpy array
+            points_array = points
         
-        self.slam_path_pub.publish(slam_path_msg)
+        if points_array.shape[0] == 0:
+            return
+        
+        # Create PointCloud2 message
+        header = std_msgs.msg.Header()
+        header.stamp = stamp if stamp is not None else self.get_clock().now().to_msg()
+        header.frame_id = frame_id if frame_id is not None else self.map_frame
+        global_voxel_map_msg = pc2.create_cloud_xyz32(header, points_array[:, :3])
+        
+        # Publish the global voxel map
+        self.global_voxel_map_pub.publish(global_voxel_map_msg)
+    
+    @timing_decorator
+    def _create_global_voxel_map(self):
+        """Create a global voxel map by transforming and combining all local voxel maps."""
+        if not self.voxel_maps:
+            return np.array([]).reshape(0, 3)
+        
+        poses = self.get_keyposes()
+        all_points = []
+        
+        for i, voxel_map_pcd in enumerate(self.voxel_maps):
+            if i >= len(poses):
+                break
+            
+            # Convert tensor PointCloud to numpy array
+            if hasattr(voxel_map_pcd, 'point'):
+                # Tensor-based PointCloud
+                points = voxel_map_pcd.point.positions.cpu().numpy()
+            else:
+                # Legacy PointCloud
+                points = np.asarray(voxel_map_pcd.points)
+            
+            if points.shape[0] == 0:
+                continue
+            
+            # Transform points to global frame
+            pose = poses[i]
+            R = pose[:3, :3]
+            t = pose[:3, 3]
+            global_points = points @ R.T + t
+            all_points.append(global_points)
+        
+        if not all_points:
+            return np.array([]).reshape(0, 3)
+        
+        # Combine all points
+        combined_points = np.vstack(all_points)
+        
+        # Apply voxel downsampling for efficiency
+        if combined_points.shape[0] > 10000:  # Only downsample if we have many points
+            combined_points = voxel_down_sample(combined_points, 0.05)
+        
+        return combined_points
+        
+    @timing_decorator
+    def publish_2D_map(self):
+        """Generate occupancy map using voxel maps and their corresponding key poses."""
+        if not self.voxel_maps:
+            return
+        
+        # Get the current key poses
+        key_poses = self.get_keyposes()
+        
+        # Ensure we have matching number of voxel maps and key poses
+        num_maps = min(len(self.voxel_maps), len(key_poses))
+        if num_maps == 0:
+            return
+        
+        # Create occupancy mapper
+        occupancy_mapper = OccupancyGridMapper(self.config.occupancy_mapper)
+        
+        # Integrate all voxel maps with their corresponding key poses
+        st_time = time.time()
+        for i in range(num_maps):
+            voxel_map_points = self.voxel_maps[i]
+            key_pose = key_poses[i]
+            
+            # Skip empty voxel maps
+            if voxel_map_points.shape[0] == 0:
+                continue
+            
+            # Integrate the voxel map points using the corresponding key pose
+            occupancy_mapper.integrate_frame(voxel_map_points, key_pose)
+        self.get_logger().info(f"Voxel maps integrated in {time.time() - st_time:.4f} seconds")
+        st_time = time.time()
+        # Compute occupancy information
+        occupancy_mapper.compute_3d_occupancy_information()
+        occupancy_mapper.compute_2d_occupancy_information()
+        self.get_logger().info(f"Occupancy information computed in {time.time() - st_time:.4f} seconds")
+        
+        # Create and publish occupancy grid message
+        msg = OccupancyGrid()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self.map_frame
+        msg.info.resolution = self.config.occupancy_mapper.resolution
+        msg.info.width = occupancy_mapper.occupancy_grid.shape[0]
+        msg.info.height = occupancy_mapper.occupancy_grid.shape[1]
+        msg.info.origin.position.x = float(occupancy_mapper.lower_bound[0]) * self.config.occupancy_mapper.resolution
+        msg.info.origin.position.y = float(occupancy_mapper.lower_bound[1]) * self.config.occupancy_mapper.resolution
+        
+        # Convert occupancy grid to ROS format
+        grid = occupancy_mapper.occupancy_grid.T.flatten()
+        free = grid < self.config.occupancy_mapper.free_threshold
+        occupied = grid > self.config.occupancy_mapper.occupied_threshold
+        grid[free] = 100      # Free cells
+        grid[occupied] = 0  # Occupied cells
+        grid[~(free | occupied)] = -1  # Unknown cells
+        msg.data = grid.astype(np.int8).tolist()
+        
+        self.map_pub.publish(msg)
 
-    def _publish_map_if_available(self):
-        """Publish 2D occupancy grid at 1Hz if available"""
-        try:
-            if self.results_queue.empty():
-                return
+    @property
+    def poses(self):
+        poses = [np.eye(4)]
+        for node in self.local_map_graph.local_maps():
+            for rel_pose in node.local_trajectory[1:]:
+                poses.append(node.keypose @ rel_pose)
+        return poses
+    
+    def get_keyposes(self):
+        return list(self.local_map_graph.keyposes())
+    
+    def _fine_grained_optimization(self):
+        pgo = PoseGraphOptimizer(self.config.pose_graph_optimizer)
+        id_ = 0
+        pgo.add_variable(id_, self.local_map_graph[id_].keypose)
+        pgo.fix_variable(id_)
+        for node in self.local_map_graph.local_maps():
+            odometry_factors = [
+                np.linalg.inv(T0) @ T1
+                for T0, T1 in zip(node.local_trajectory[:-1], node.local_trajectory[1:])
+            ]
+            for i, factor in enumerate(odometry_factors):
+                pgo.add_variable(id_ + 1, node.keypose @ node.local_trajectory[i + 1])
+                pgo.add_factor(id_ + 1, id_, factor, np.eye(6))
+                id_ += 1
+            pgo.fix_variable(id_ - 1)
 
-            # Skip if no lidar data received yet
-            if self.latest_lidar_timestamp is None:
-                return
-            
-            map_data = self.results_queue.get_nowait()
-            
-            # Create OccupancyGrid message
-            occupancy_msg = OccupancyGrid()
-            occupancy_msg.header.stamp = self.latest_lidar_timestamp  # Use lidar timestamp
-            occupancy_msg.header.frame_id = self.map_frame
-            
-            # Set map metadata
-            occupancy_msg.info.resolution = map_data['occupancy_grid_config'].resolution
-            occupancy_msg.info.width = int(map_data['occupancy_grid'].shape[0])
-            occupancy_msg.info.height = int(map_data['occupancy_grid'].shape[1])
-            
-            occupancy_msg.info.origin.position.x = float(map_data['occupancy_grid_lower_bound'][0]) * map_data['occupancy_grid_config'].resolution
-            occupancy_msg.info.origin.position.y = float(map_data['occupancy_grid_lower_bound'][1]) * map_data['occupancy_grid_config'].resolution
-            occupancy_msg.info.origin.position.z = 0.0
-            occupancy_msg.info.origin.orientation.x = 0.0
-            occupancy_msg.info.origin.orientation.y = 0.0
-            occupancy_msg.info.origin.orientation.z = 0.0
-            occupancy_msg.info.origin.orientation.w = 1.0
-            
-            # Convert occupancy grid to ROS format
-            occupancy_data = map_data['occupancy_grid'].T.copy()
-            occupancy_data = occupancy_data.flatten()
-            
-            # Vectorized conversion for ROS message
-            free = occupancy_data < map_data['occupancy_grid_config'].free_threshold
-            occupied = occupancy_data > map_data['occupancy_grid_config'].occupied_threshold
-            ros_occupancy_data = np.full_like(occupancy_data, -1, dtype=np.int8)
-            ros_occupancy_data[free] = 100
-            ros_occupancy_data[occupied] = 0
-            ros_occupancy_data = ros_occupancy_data.flatten().tolist()
-            
-            occupancy_msg.data = ros_occupancy_data
-            
-            # Publish the map
-            self.map_pub.publish(occupancy_msg)
-                
-        except queue.Empty:
-            pass
-        except Exception as e:
-            self.get_logger().warn(f'Failed to publish occupancy grid: {str(e)}')
+        pgo.optimize()
+        poses = [x for x in pgo.estimates().values()]
+        return poses, pgo
+
 
     def destroy_node(self):
-        """Clean shutdown with proper thread termination"""
-        # Signal the SLAM thread to shutdown
-        self.shutdown_event.set()
-        
-        # Wait for the SLAM thread to finish
-        if self.slam_thread and self.slam_thread.is_alive():
-            rclpy.logging.get_logger('kiss_slam_ros').info('Waiting for SLAM thread to finish...')
-            self.slam_thread.join(timeout=5.0)  # Wait up to 5 seconds
-            if self.slam_thread.is_alive():
-                rclpy.logging.get_logger('kiss_slam_ros').warn('SLAM thread did not finish gracefully')
-        
+        self.get_logger().info("Shutting down SLAM node...")
         super().destroy_node()
 
 def main(args=None):
     rclpy.init(args=args)
-    node = SlamNode()
-
+    node = SLAMNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info('KeyboardInterrupt: shutting down')
+        pass
     finally:
         node.destroy_node()
         rclpy.shutdown()
-
 
 if __name__ == '__main__':
     main()

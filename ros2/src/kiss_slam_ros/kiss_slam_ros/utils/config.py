@@ -7,6 +7,7 @@ from kiss_slam.config.config import (
     LoopCloserConfig,
     PoseGraphOptimizerConfig
 )
+from kiss_icp.config.parser import KISSConfig
 from kiss_icp.config.config import (
     AdaptiveThresholdConfig,
     DataConfig,
@@ -84,29 +85,75 @@ def declare_parameters(node: Node):
     node.declare_parameter('save_2d_map', True)
     node.declare_parameter('save_3d_map', True)
 
-def get_kiss_slam_config(node: Node) -> KissSLAMConfig:
-    config = KissSLAMConfig(
-        odometry=KissOdometryConfig(
-            preprocessing=DataConfig(
-                max_range=get_param_value(node, 'kiss_slam.odometry.preprocessing.max_range', 100.0),
-                min_range=get_param_value(node, 'kiss_slam.odometry.preprocessing.min_range', 0.0),
-                deskew=get_param_value(node, 'kiss_slam.odometry.preprocessing.deskew', True),
-            ),
-            registration=RegistrationConfig(
-                max_num_iterations=get_param_value(node, 'kiss_slam.odometry.registration.max_num_iterations', 500),
-                convergence_criterion=get_param_value(node, 'kiss_slam.odometry.registration.convergence_criterion', 0.0001),
-                max_num_threads=get_param_value(node, 'kiss_slam.odometry.registration.max_num_threads', 0),
-            ),
-            mapping=MappingConfig(
-                voxel_size=get_param_value(node, 'kiss_slam.odometry.mapping.voxel_size', None),
-                max_points_per_voxel=get_param_value(node, 'kiss_slam.odometry.mapping.max_points_per_voxel', 20),
-            ),
-            adaptive_threshold=AdaptiveThresholdConfig(
-                fixed_threshold=get_param_value(node, 'kiss_slam.odometry.adaptive_threshold.fixed_threshold', None),
-                initial_threshold=get_param_value(node, 'kiss_slam.odometry.adaptive_threshold.initial_threshold', 2.0),
-                min_motion_th=get_param_value(node, 'kiss_slam.odometry.adaptive_threshold.min_motion_th', 0.1),
-            )
+def get_kiss_icp_config(node: Node) -> KISSConfig:
+    """Get KISS-ICP configuration for odometry node."""
+    # Create the KissOdometryConfig first to match the SLAM structure
+    odometry_config = KissOdometryConfig(
+        preprocessing=DataConfig(
+            max_range=get_param_value(node, 'kiss_slam.odometry.preprocessing.max_range', 100.0),
+            min_range=get_param_value(node, 'kiss_slam.odometry.preprocessing.min_range', 0.0),
+            deskew=get_param_value(node, 'kiss_slam.odometry.preprocessing.deskew', True),
         ),
+        registration=RegistrationConfig(
+            max_num_iterations=get_param_value(node, 'kiss_slam.odometry.registration.max_num_iterations', 500),
+            convergence_criterion=get_param_value(node, 'kiss_slam.odometry.registration.convergence_criterion', 0.0001),
+            max_num_threads=get_param_value(node, 'kiss_slam.odometry.registration.max_num_threads', 0),
+        ),
+        mapping=MappingConfig(
+            voxel_size=get_param_value(node, 'kiss_slam.odometry.mapping.voxel_size', None),
+            max_points_per_voxel=get_param_value(node, 'kiss_slam.odometry.mapping.max_points_per_voxel', 20),
+        ),
+        adaptive_threshold=AdaptiveThresholdConfig(
+            fixed_threshold=get_param_value(node, 'kiss_slam.odometry.adaptive_threshold.fixed_threshold', None),
+            initial_threshold=get_param_value(node, 'kiss_slam.odometry.adaptive_threshold.initial_threshold', 2.0),
+            min_motion_th=get_param_value(node, 'kiss_slam.odometry.adaptive_threshold.min_motion_th', 0.1),
+        )
+    )
+
+    if odometry_config.mapping.voxel_size is None:
+        odometry_config.mapping.voxel_size = float(odometry_config.preprocessing.max_range / 100.0)
+    
+    # Convert to KISSConfig using the kiss_icp_config() method
+    config = KISSConfig(
+        data=odometry_config.preprocessing,
+        registration=odometry_config.registration,
+        mapping=odometry_config.mapping,
+        adaptive_threshold=odometry_config.adaptive_threshold,
+    )
+        
+    return config
+
+def get_kiss_slam_config(node: Node) -> KissSLAMConfig:
+    """Get full KISS-SLAM configuration for SLAM node."""
+    # Use default odometry config since SLAM node doesn't need detailed odometry params
+    default_odometry_config = KissOdometryConfig(
+        preprocessing=DataConfig(
+            max_range=get_param_value(node, 'kiss_slam.odometry.preprocessing.max_range', 100.0),
+            min_range=get_param_value(node, 'kiss_slam.odometry.preprocessing.min_range', 0.0),
+            deskew=get_param_value(node, 'kiss_slam.odometry.preprocessing.deskew', True),
+        ),
+        registration=RegistrationConfig(
+            max_num_iterations=get_param_value(node, 'kiss_slam.odometry.registration.max_num_iterations', 500),
+            convergence_criterion=get_param_value(node, 'kiss_slam.odometry.registration.convergence_criterion', 0.0001),
+            max_num_threads=get_param_value(node, 'kiss_slam.odometry.registration.max_num_threads', 0),
+        ),
+        mapping=MappingConfig(
+            voxel_size=get_param_value(node, 'kiss_slam.odometry.mapping.voxel_size', None),
+            max_points_per_voxel=get_param_value(node, 'kiss_slam.odometry.mapping.max_points_per_voxel', 20),
+        ),
+        adaptive_threshold=AdaptiveThresholdConfig(
+            fixed_threshold=get_param_value(node, 'kiss_slam.odometry.adaptive_threshold.fixed_threshold', None),
+            initial_threshold=get_param_value(node, 'kiss_slam.odometry.adaptive_threshold.initial_threshold', 2.0),
+            min_motion_th=get_param_value(node, 'kiss_slam.odometry.adaptive_threshold.min_motion_th', 0.1),
+        )
+    )
+    
+    # Apply voxel size defaults
+    if default_odometry_config.mapping.voxel_size is None:
+        default_odometry_config.mapping.voxel_size = float(default_odometry_config.preprocessing.max_range / 100.0)
+    
+    config = KissSLAMConfig(
+        odometry=default_odometry_config,
         local_mapper=LocalMapperConfig(
             voxel_size=get_param_value(node, 'kiss_slam.local_mapper.voxel_size', 0.5),
             splitting_distance=get_param_value(node, 'kiss_slam.local_mapper.splitting_distance', 100.0),
@@ -133,10 +180,7 @@ def get_kiss_slam_config(node: Node) -> KissSLAMConfig:
         )
     )
 
-    if config.odometry.mapping.voxel_size is None:
-        config.odometry.mapping.voxel_size = float(config.odometry.preprocessing.max_range / 100.0)
-
     if config.occupancy_mapper.max_range is None:
-        config.occupancy_mapper.max_range = config.odometry.preprocessing.max_range
+        config.occupancy_mapper.max_range = default_odometry_config.preprocessing.max_range
         
     return config

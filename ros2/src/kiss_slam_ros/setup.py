@@ -24,7 +24,8 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'slam_node = kiss_slam_ros.slam_node:main'
+            'slam_node = kiss_slam_ros.slam_node:main',
+            'odometry_node = kiss_slam_ros.odometry_node:main'
         ],
     },
 )
