@@ -17,12 +17,14 @@ def generate_launch_description():
     topic = LaunchConfiguration("topic", default="/j100_0000/sensors/lidar3d_0/points")
     visualize = LaunchConfiguration("visualize", default="true")
     bagfile = LaunchConfiguration("bagfile", default="")
+    namespace = LaunchConfiguration("namespace", default="")
 
     # SLAM node
     slam_node = Node(
         package="kiss_slam_ros",
         executable="slam_node",
         name="slam_node",
+        namespace=namespace,
         output="screen",
         parameters=[
             PathJoinSubstitution(
@@ -36,6 +38,7 @@ def generate_launch_description():
         package="kiss_slam_ros",
         executable="odometry_node",
         name="odometry_node",
+        namespace=namespace,
         output="screen",
         remappings=[
             ("/points_raw", topic),
@@ -52,6 +55,7 @@ def generate_launch_description():
         package="rviz2",
         executable="rviz2",
         output="screen",
+        namespace=namespace,
         arguments=[
             "-d",
             PathJoinSubstitution(
@@ -94,6 +98,7 @@ def generate_launch_description():
             DeclareLaunchArgument("topic", default_value="/ouster/points"),
             DeclareLaunchArgument("visualize", default_value="true"),
             DeclareLaunchArgument("bagfile", default_value=""),
+            DeclareLaunchArgument("namespace", default_value=""),
             slam_node,
             odometry_node,
             bagfile_play,

@@ -205,7 +205,7 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /deskewed_points
+        Value: deskewed_points
       Use Fixed Frame: true
       Use rainbow: true
       Value: true
@@ -239,7 +239,7 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /global_voxel_map
+        Value: global_voxel_map
       Use Fixed Frame: true
       Use rainbow: true
       Value: true
@@ -269,7 +269,7 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /slam_path
+        Value: slam_path
       Value: true
   Enabled: true
   Global Options:

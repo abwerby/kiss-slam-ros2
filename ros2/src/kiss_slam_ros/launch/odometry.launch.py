@@ -14,6 +14,7 @@ def generate_launch_description():
     # Launch arguments
     topic = LaunchConfiguration("topic", default="/ouster/points")
     bagfile = LaunchConfiguration("bagfile", default="")
+    namespace = LaunchConfiguration("namespace", default="")
 
 
     # Odometry node
@@ -21,6 +22,7 @@ def generate_launch_description():
         package="kiss_slam_ros",
         executable="odometry_node",
         name="odometry_node",
+        namespace=namespace,
         output="screen",
         remappings=[
             ("/points_raw", topic),
@@ -46,6 +48,7 @@ def generate_launch_description():
             DeclareLaunchArgument("topic", default_value="/j100_0000/sensors/lidar3d_0/points"),
             DeclareLaunchArgument("base_frame", default_value="base_link"),
             DeclareLaunchArgument("odom_frame", default_value="odom"),
+            DeclareLaunchArgument("namespace", default_value=""),
             odometry_node,
             bagfile_play,
         ]

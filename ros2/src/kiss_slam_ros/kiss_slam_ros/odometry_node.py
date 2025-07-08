@@ -56,10 +56,10 @@ class OdometryNode(Node):
     def _init_publishers(self):
         """Initialize all ROS publishers."""
         path_qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST, depth=10)
-        self.odom_path_pub = self.create_publisher(Path, '/odom_path', path_qos)
-        self.pose_pub = self.create_publisher(PoseStamped, '/odom_pose', path_qos)
-        self.deskewed_pub = self.create_publisher(PointCloud2, '/deskewed_points', 10)
-        self.local_map_pub = self.create_publisher(PointCloud2, '/local_map', path_qos)
+        self.odom_path_pub = self.create_publisher(Path, 'odom_path', path_qos)
+        self.pose_pub = self.create_publisher(PoseStamped, 'odom_pose', path_qos)
+        self.deskewed_pub = self.create_publisher(PointCloud2, 'deskewed_points', 10)
+        self.local_map_pub = self.create_publisher(PointCloud2, 'local_map', path_qos)
 
     def _init_subscribers_and_timers(self):
         """Initialize subscribers and timers with dedicated callback groups."""

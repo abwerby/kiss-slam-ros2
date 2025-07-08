@@ -92,18 +92,18 @@ class SLAMNode(Node):
         """Initialize all ROS publishers."""
         map_qos = QoSProfile(durability=DurabilityPolicy.TRANSIENT_LOCAL, reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST, depth=1)
         path_qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST, depth=10)
-        self.slam_path_pub = self.create_publisher(Path, '/slam_path', path_qos)
-        self.map_pub = self.create_publisher(OccupancyGrid, '/map', map_qos)
-        self.global_voxel_map_pub = self.create_publisher(PointCloud2, '/global_voxel_map', 10)
+        self.slam_path_pub = self.create_publisher(Path, 'slam_path', path_qos)
+        self.map_pub = self.create_publisher(OccupancyGrid, 'map', map_qos)
+        self.global_voxel_map_pub = self.create_publisher(PointCloud2, 'global_voxel_map', 10)
         self.create_timer(2.0, self.publish_2D_map, callback_group=self.slow_callback_group)  # Publish map every 2 seconds
         self.create_timer(0.2, self.publish_slam_path, callback_group=self.slow_callback_group)
 
     def _init_subscribers(self):
         """Initialize message_filters subscribers to synchronize keyframe data."""
         # Subscribe to the local map and the corresponding odometry pose
-        deskewed_points_sub = message_filters.Subscriber(self, PointCloud2, '/deskewed_points')
-        local_map_sub = message_filters.Subscriber(self, PointCloud2, '/local_map')
-        odom_pose_sub = message_filters.Subscriber(self, PoseStamped, '/odom_pose')
+        deskewed_points_sub = message_filters.Subscriber(self, PointCloud2, 'deskewed_points')
+        local_map_sub = message_filters.Subscriber(self, PointCloud2, 'local_map')
+        odom_pose_sub = message_filters.Subscriber(self, PoseStamped, 'odom_pose')
 
         # Synchronize the topics by timestamp
         self.ts = message_filters.TimeSynchronizer([deskewed_points_sub, odom_pose_sub, local_map_sub], 10)
