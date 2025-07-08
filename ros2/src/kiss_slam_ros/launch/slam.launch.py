@@ -57,7 +57,6 @@ def generate_launch_description():
             PathJoinSubstitution(
                 [FindPackageShare("kiss_slam_ros"), "rviz", "slam.rviz"]
             ),
-            "require=true",
         ],
         condition=IfCondition(visualize),
     )

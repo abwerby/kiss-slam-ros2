@@ -96,7 +96,7 @@ class SLAMNode(Node):
         self.map_pub = self.create_publisher(OccupancyGrid, '/map', map_qos)
         self.global_voxel_map_pub = self.create_publisher(PointCloud2, '/global_voxel_map', 10)
         # self.create_timer(2.0, self.publish_2D_map, callback_group=self.slow_callback_group)  # Publish map every 2 seconds
-        self.create_timer(0.5, self.publish_slam_path, callback_group=self.slow_callback_group)
+        self.create_timer(0.2, self.publish_slam_path, callback_group=self.slow_callback_group)
 
     def _init_subscribers(self):
         """Initialize message_filters subscribers to synchronize keyframe data."""
@@ -128,6 +128,11 @@ class SLAMNode(Node):
         self.voxel_grid.integrate_frame(mapping_frame, current_keyframe_pose)
         self.local_map_graph.last_local_map.local_trajectory.append(current_keyframe_pose)
 
+
+        # 3. Update and publish the map->odom transform and SLAM path
+        self._publish_transform(self.get_keyposes()[-1], stamp, self.map_frame, self.odom_frame)
+
+        # split local map if necessary
         if np.linalg.norm(current_keyframe_pose[:3, -1]) > self.local_map_splitting_distance:
             last_local_map = self.local_map_graph.last_local_map
             query_id = last_local_map.id
@@ -144,18 +149,7 @@ class SLAMNode(Node):
             self._compute_closures(query_id, query_points)
             gmap = self._create_global_voxel_map()
             self.publish_pc2(gmap, frame_id=self.map_frame, stamp=stamp)  # Publish the global voxel map
-            # pcd = self._transform_points(query_points, self.get_keyposes()[-2])
-            # self.publish_pc2(pcd, frame_id=self.map_frame, stamp=stamp)  # Publish the global voxel map
-            # self.publish_2D_map()  # Publish the 2D map after each local map is finalized
-            # self.poses, _ = self._fine_grained_optimization()
 
-        # self.get_logger().info(
-        #     f"Number of voxel maps: {len(self.voxel_maps)}, Last voxel map size: {len(self.voxel_maps[-1]) if self.voxel_maps else 0}, "
-        #     f"Number of local maps: {len(self.local_maps)}, Last local map size: {len(self.local_maps[-1]) if self.local_maps else 0}"
-        # )
-
-        # 3. Update and publish the map->odom transform and SLAM path
-        self._publish_transform(self.get_keyposes()[-1], stamp, self.map_frame, self.odom_frame)
 
     def _msg_to_pose(self, pose_msg) -> np.ndarray:
         """Convert a geometry_msgs/Pose to a 4x4 numpy array."""
@@ -213,7 +207,6 @@ class SLAMNode(Node):
         for id_, pose in estimates.items():
             self.local_map_graph[id_].keypose = np.copy(pose)
 
-    @timing_decorator
     def publish_pc2(self, points, frame_id=None, stamp=None):
         """Publish the points as a PointCloud2 message."""
         # Handle different input types
