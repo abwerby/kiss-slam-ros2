@@ -64,7 +64,7 @@ def generate_launch_description():
     # Bag playback
     bagfile_play = ExecuteProcess(
         # --remap /j100_0819/tf:=/tf /j100_0819/tf_static:=/tf_static
-        cmd=["ros2", "bag", "play", "--rate", "2", bagfile, "--clock", "--remap", "/j100_0819/tf:=/tf", "--remap", "/j100_0819/tf_static:=/tf_static"],
+        cmd=["ros2", "bag", "play", "--rate", "1", bagfile, "--clock", "--remap", "/j100_0819/tf:=/tf", "--remap", "/j100_0819/tf_static:=/tf_static"],
         output="screen",
         condition=IfCondition(PythonExpression(["'", bagfile, "' != ''"])),
     )

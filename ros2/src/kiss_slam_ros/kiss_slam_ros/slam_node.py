@@ -95,7 +95,7 @@ class SLAMNode(Node):
         self.slam_path_pub = self.create_publisher(Path, '/slam_path', path_qos)
         self.map_pub = self.create_publisher(OccupancyGrid, '/map', map_qos)
         self.global_voxel_map_pub = self.create_publisher(PointCloud2, '/global_voxel_map', 10)
-        # self.create_timer(2.0, self.publish_2D_map, callback_group=self.slow_callback_group)  # Publish map every 2 seconds
+        self.create_timer(2.0, self.publish_2D_map, callback_group=self.slow_callback_group)  # Publish map every 2 seconds
         self.create_timer(0.2, self.publish_slam_path, callback_group=self.slow_callback_group)
 
     def _init_subscribers(self):
@@ -114,7 +114,6 @@ class SLAMNode(Node):
         This callback is triggered only when a synchronized pair of deskewed_points and odom_pose messages arrives.
         """
         stamp = odom_pose_msg.header.stamp
-        # self.get_logger().info(f"Synchronized keyframe received for timestamp {stamp.sec}.{stamp.nanosec}")
 
         # 1. Extract data from messages
         points_np = pc2.read_points(deskewed_points_msg, field_names=("x", "y", "z"), skip_nans=True)
@@ -127,7 +126,6 @@ class SLAMNode(Node):
         mapping_frame = voxel_down_sample(keyframe_points, self.local_map_voxel_size)
         self.voxel_grid.integrate_frame(mapping_frame, current_keyframe_pose)
         self.local_map_graph.last_local_map.local_trajectory.append(current_keyframe_pose)
-
 
         # 3. Update and publish the map->odom transform and SLAM path
         self._publish_transform(self.get_keyposes()[-1], stamp, self.map_frame, self.odom_frame)
@@ -271,7 +269,7 @@ class SLAMNode(Node):
         
         # Apply voxel downsampling for efficiency
         if combined_points.shape[0] > 10000:  # Only downsample if we have many points
-            combined_points = voxel_down_sample(combined_points, 0.05)
+            combined_points = voxel_down_sample(combined_points, self.local_map_voxel_size)
         
         return combined_points
         
@@ -291,26 +289,12 @@ class SLAMNode(Node):
         
         # Create occupancy mapper
         occupancy_mapper = OccupancyGridMapper(self.config.occupancy_mapper)
-        
         # Integrate all voxel maps with their corresponding key poses
-        st_time = time.time()
-        for i in range(num_maps):
-            voxel_map_points = self.voxel_maps[i]
-            key_pose = key_poses[i]
-            
-            # Skip empty voxel maps
-            if voxel_map_points.shape[0] == 0:
-                continue
-            
-            # Integrate the voxel map points using the corresponding key pose
-            occupancy_mapper.integrate_frame(voxel_map_points, key_pose)
-        self.get_logger().info(f"Voxel maps integrated in {time.time() - st_time:.4f} seconds")
-        st_time = time.time()
+        pcd = self._create_global_voxel_map()
+        occupancy_mapper.integrate_frame(pcd, key_poses[0])
         # Compute occupancy information
         occupancy_mapper.compute_3d_occupancy_information()
         occupancy_mapper.compute_2d_occupancy_information()
-        self.get_logger().info(f"Occupancy information computed in {time.time() - st_time:.4f} seconds")
-        
         # Create and publish occupancy grid message
         msg = OccupancyGrid()
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -324,11 +308,11 @@ class SLAMNode(Node):
         # Convert occupancy grid to ROS format
         grid = occupancy_mapper.occupancy_grid.T.flatten()
         free = grid < self.config.occupancy_mapper.free_threshold
-        occupied = grid > self.config.occupancy_mapper.occupied_threshold
+        occupied = grid > self.config.occupancy_mapper.free_threshold
         grid[free] = 100      # Free cells
         grid[occupied] = 0  # Occupied cells
         grid[~(free | occupied)] = -1  # Unknown cells
-        msg.data = grid.astype(np.int8).tolist()
+        msg.data = (grid).astype(np.int8).tolist()
         
         self.map_pub.publish(msg)
 
