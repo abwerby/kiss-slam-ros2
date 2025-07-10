@@ -1,4 +1,5 @@
 import rclpy
+from rclpy.logging import get_logger
 import numpy as np
 import message_filters
 import time
@@ -7,15 +8,15 @@ import functools
 from scipy.spatial.transform import Rotation as R
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+from message_filters import Subscriber, TimeSynchronizer
 
 from sensor_msgs.msg import PointCloud2
 from geometry_msgs.msg import PoseStamped, TransformStamped
-from nav_msgs.msg import Path, OccupancyGrid
+from nav_msgs.msg import Path, OccupancyGrid, Odometry
 import std_msgs.msg
 from sensor_msgs_py import point_cloud2 as pc2
 import tf2_ros
 from rclpy.callback_groups import ReentrantCallbackGroup, MutuallyExclusiveCallbackGroup
-import open3d as o3d
 from kiss_icp.voxelization import voxel_down_sample
 from kiss_slam.local_map_graph import LocalMapGraph
 from kiss_slam.occupancy_mapper import OccupancyGridMapper
@@ -59,6 +60,7 @@ class SLAMNode(Node):
         local_map_config = self.config.local_mapper
         self.local_map_voxel_size = local_map_config.voxel_size
         self.voxel_grid = VoxelMap(self.local_map_voxel_size)
+        self.odom_local_map = VoxelMap(1.5)  # Larger voxel size for odometry local map
         self.local_map_graph = LocalMapGraph()
         self.local_map_splitting_distance = local_map_config.splitting_distance
         self.optimizer = PoseGraphOptimizer(self.config.pose_graph_optimizer)
@@ -67,6 +69,8 @@ class SLAMNode(Node):
         # state variables
         self.local_maps = []  # List to store local maps
         self.voxel_maps = []  # List to store voxel maps
+        self.traveled_distance = 0.0 # Distance traveled since the last local map split
+        self.last_split_pose = np.eye(4)  # Last pose at which the local map was split
 
         # ROS Communications
         self.fast_callback_group = ReentrantCallbackGroup()
@@ -90,73 +94,115 @@ class SLAMNode(Node):
 
     def _init_publishers(self):
         """Initialize all ROS publishers."""
-        map_qos = QoSProfile(durability=DurabilityPolicy.TRANSIENT_LOCAL, reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST, depth=1)
+        map_qos = QoSProfile(durability=DurabilityPolicy.TRANSIENT_LOCAL, reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST, depth=10)
         path_qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST, depth=10)
-        self.slam_path_pub = self.create_publisher(Path, 'slam_path', path_qos)
+        # self.slam_path_pub = self.create_publisher(Path, 'slam_path', path_qos)
         self.map_pub = self.create_publisher(OccupancyGrid, 'map', map_qos)
-        self.global_voxel_map_pub = self.create_publisher(PointCloud2, 'global_voxel_map', 10)
-        self.create_timer(2.0, self.publish_2D_map, callback_group=self.slow_callback_group)  # Publish map every 2 seconds
-        self.create_timer(0.2, self.publish_slam_path, callback_group=self.slow_callback_group)
+        self.pose_pub = self.create_publisher(PoseStamped, 'global_pose', path_qos)
+        self.global_voxel_map_pub = self.create_publisher(PointCloud2, 'global_voxel_map', map_qos)
+        # self.create_timer(2.0, self.publish_2D_map, callback_group=self.slow_callback_group)  # Publish map every 2 seconds
+        # self.create_timer(0.2, self.publish_slam_path, callback_group=self.slow_callback_group) # Only for debugging purposes and visualization
 
     def _init_subscribers(self):
         """Initialize message_filters subscribers to synchronize keyframe data."""
         # Subscribe to the local map and the corresponding odometry pose
-        deskewed_points_sub = message_filters.Subscriber(self, PointCloud2, 'deskewed_points')
-        local_map_sub = message_filters.Subscriber(self, PointCloud2, 'local_map')
-        odom_pose_sub = message_filters.Subscriber(self, PoseStamped, 'odom_pose')
-
-        # Synchronize the topics by timestamp
-        self.ts = message_filters.TimeSynchronizer([deskewed_points_sub, odom_pose_sub, local_map_sub], 10)
+        qos = QoSProfile(
+            history=HistoryPolicy.KEEP_ALL,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        deskewed_points_sub = Subscriber(
+            self,
+            PointCloud2,
+            'deskewed_points',
+            qos_profile=qos
+        )
+        odom_sub = Subscriber(
+            self,
+            Odometry,
+            'odometry',
+            qos_profile=qos
+        )
+        self.ts = TimeSynchronizer([deskewed_points_sub, odom_sub], 20)
         self.ts.registerCallback(self.keyframe_callback)
 
-    def keyframe_callback(self, deskewed_points_msg: PointCloud2, odom_pose_msg: PoseStamped, local_map_msg: PointCloud2):
+    def keyframe_callback(self, deskewed_points_msg: PointCloud2, odom_msg: Odometry):
         """
-        This callback is triggered only when a synchronized pair of deskewed_points and odom_pose messages arrives.
+        This callback is triggered only when a synchronized pair of deskewed_points and odometry messages arrives.
         """
-        stamp = odom_pose_msg.header.stamp
+        stamp = odom_msg.header.stamp
 
         # 1. Extract data from messages
         points_np = pc2.read_points(deskewed_points_msg, field_names=("x", "y", "z"), skip_nans=True)
         keyframe_points = np.vstack([points_np['x'], points_np['y'], points_np['z']]).T.astype(np.float64)
-        current_keyframe_pose = self._msg_to_pose(odom_pose_msg.pose)
-        points_np_local_map = pc2.read_points(local_map_msg, field_names=("x", "y", "z"), skip_nans=True)
-        local_map_points = np.vstack([points_np_local_map['x'], points_np_local_map['y'], points_np_local_map['z']]).T.astype(np.float64)
-        
+        current_keyframe_pose = self._msg_to_pose(odom_msg.pose.pose)
+        relative_motion = np.linalg.inv(self.last_split_pose) @ current_keyframe_pose
+
         # 2. update voxel grid and local map graph
         mapping_frame = voxel_down_sample(keyframe_points, self.local_map_voxel_size)
-        self.voxel_grid.integrate_frame(mapping_frame, current_keyframe_pose)
-        self.local_map_graph.last_local_map.local_trajectory.append(current_keyframe_pose)
+        self.voxel_grid.integrate_frame(mapping_frame, relative_motion)
+        self.odom_local_map.integrate_frame(keyframe_points, relative_motion)
+        self.local_map_graph.last_local_map.local_trajectory.append(relative_motion)
 
         # 3. Update and publish the map->odom transform and SLAM path
-        self._publish_transform(self.get_keyposes()[-1], stamp, self.map_frame, self.odom_frame)
+        keyposes = self.get_keyposes()
+        poses = self.poses
+        self._publish_transform(keyposes[0], stamp, self.map_frame, self.odom_frame)            
+        self._publish_pose(poses[-1], stamp, self.map_frame)
 
+        # 4. update traveled distance and check if we need to split the local map
+        current_step_distance = np.linalg.norm(relative_motion[:3, -1])
+        
         # split local map if necessary
-        if np.linalg.norm(current_keyframe_pose[:3, -1]) > self.local_map_splitting_distance:
+        if current_step_distance > self.local_map_splitting_distance:
+            # update the last split pose for relative motion
+            self.last_split_pose = np.copy(current_keyframe_pose)
+            # append the current voxel grid to the list of voxel maps
             last_local_map = self.local_map_graph.last_local_map
+            last_pose__last_local_map = last_local_map.local_trajectory[-1]
+            self.voxel_maps.append(self.voxel_grid.open3d_pcd_with_normals())
+            transformed_local_map = self._transform_points(self.odom_local_map.point_cloud(), np.linalg.inv(last_local_map.local_trajectory[-1]))
+            self.odom_local_map.clear()
             query_id = last_local_map.id
             query_points = self.voxel_grid.point_cloud()
-            self.voxel_maps.append(self.voxel_grid.open3d_pcd_with_normals())
             self.local_map_graph.finalize_local_map(self.voxel_grid)
-            self.local_maps.append(local_map_points)
             self.voxel_grid.clear()
-            self.voxel_grid.add_points(local_map_points)
+            self.voxel_grid.add_points(transformed_local_map)
             self.optimizer.add_variable(self.local_map_graph.last_id, self.local_map_graph.last_keypose)
             self.optimizer.add_factor(
-                self.local_map_graph.last_id, query_id, last_local_map.local_trajectory[-1], np.eye(6)
+                self.local_map_graph.last_id, query_id, last_pose__last_local_map, np.eye(6)
             )
             self._compute_closures(query_id, query_points)
             gmap = self._create_global_voxel_map()
-            self.publish_pc2(gmap, frame_id=self.map_frame, stamp=stamp)  # Publish the global voxel map
-
+            self.publish_pc2(gmap, frame_id=self.map_frame, stamp=stamp)
 
     def _msg_to_pose(self, pose_msg) -> np.ndarray:
-        """Convert a geometry_msgs/Pose to a 4x4 numpy array."""
+        """Convert a nav_msgs/Odometry to a 4x4 numpy array."""
         p = pose_msg.position
         o = pose_msg.orientation
         pose = np.eye(4)
         pose[:3, 3] = [p.x, p.y, p.z]
         pose[:3, :3] = R.from_quat([o.x, o.y, o.z, o.w]).as_matrix()
         return pose
+
+    def _transform_points(self, pcd, T):
+        R = T[:3, :3]
+        t = T[:3, -1]
+        return pcd @ R.T + t
+
+    def _publish_pose(self, pose: np.ndarray, stamp, frame_id: str):
+        p = PoseStamped()
+        p.header.stamp = stamp
+        p.header.frame_id = frame_id
+        p.pose.position.x = pose[0, 3]
+        p.pose.position.y = pose[1, 3]
+        p.pose.position.z = pose[2, 3]
+        quat = R.from_matrix(pose[:3, :3]).as_quat()
+        p.pose.orientation.x = quat[0]
+        p.pose.orientation.y = quat[1]
+        p.pose.orientation.z = quat[2]
+        p.pose.orientation.w = quat[3]
+        self.pose_pub.publish(p)
 
     def _publish_transform(self, pose: np.ndarray, stamp, frame_id: str, child_frame_id: str):
         t = TransformStamped()
@@ -230,13 +276,13 @@ class SLAMNode(Node):
         # Publish the global voxel map
         self.global_voxel_map_pub.publish(global_voxel_map_msg)
     
-    @timing_decorator
     def _create_global_voxel_map(self):
         """Create a global voxel map by transforming and combining all local voxel maps."""
         if not self.voxel_maps:
             return np.array([]).reshape(0, 3)
         
         poses = self.get_keyposes()
+        # poses = self.poses  # Use the current poses from the local map graph
         all_points = []
         
         for i, voxel_map_pcd in enumerate(self.voxel_maps):
@@ -247,6 +293,9 @@ class SLAMNode(Node):
             if hasattr(voxel_map_pcd, 'point'):
                 # Tensor-based PointCloud
                 points = voxel_map_pcd.point.positions.cpu().numpy()
+            # check if it is a numpy array already
+            elif isinstance(voxel_map_pcd, np.ndarray):
+                points = voxel_map_pcd
             else:
                 # Legacy PointCloud
                 points = np.asarray(voxel_map_pcd.points)

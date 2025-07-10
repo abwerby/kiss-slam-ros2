@@ -18,6 +18,7 @@ def generate_launch_description():
     visualize = LaunchConfiguration("visualize", default="true")
     bagfile = LaunchConfiguration("bagfile", default="")
     namespace = LaunchConfiguration("namespace", default="")
+    use_sim_time = LaunchConfiguration("use_sim_time", default="true")
 
     # SLAM node
     slam_node = Node(
@@ -29,7 +30,8 @@ def generate_launch_description():
         parameters=[
             PathJoinSubstitution(
                 [FindPackageShare("kiss_slam_ros"), "config", "slam_params.yaml"]
-            )
+            ),
+            {"use_sim_time": use_sim_time},
         ],
     )
 
@@ -46,7 +48,8 @@ def generate_launch_description():
         parameters=[
             PathJoinSubstitution(
                 [FindPackageShare("kiss_slam_ros"), "config", "odometry_params.yaml"]
-            )
+            ),
+            {"use_sim_time": use_sim_time}
         ],
     )
 
@@ -66,10 +69,23 @@ def generate_launch_description():
     )
 
     # Bag playback
+    override_qos_yaml = PathJoinSubstitution([
+        FindPackageShare('kiss_slam_ros'),
+        'config',
+        'override_qos.yaml'
+    ])
+
     bagfile_play = ExecuteProcess(
-        # --remap /j100_0819/tf:=/tf /j100_0819/tf_static:=/tf_static
-        cmd=["ros2", "bag", "play", "--rate", "1", bagfile, "--clock", "--remap", "/j100_0819/tf:=/tf", "--remap", "/j100_0819/tf_static:=/tf_static"],
-        output="screen",
+        cmd=[
+            'ros2', 'bag', 'play',
+            '--rate', '1',
+            bagfile,
+            '--clock',
+            '--qos-profile-overrides-path', override_qos_yaml,
+            '--remap', '/j100_0819/tf:=/tf',
+            '--remap', '/j100_0819/tf_static:=/tf_static'
+        ],
+        output='screen',
         condition=IfCondition(PythonExpression(["'", bagfile, "' != ''"])),
     )
 
@@ -103,11 +119,5 @@ def generate_launch_description():
             odometry_node,
             bagfile_play,
             rviz_node,
-            RegisterEventHandler(
-                OnProcessExit(
-                    target_action=bagfile_play,
-                    on_exit=[Shutdown()]
-                )
-            ),
         ]
     )

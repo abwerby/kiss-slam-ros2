@@ -1,0 +1,6 @@
+# config/override_qos.yaml
+/ouster/points:
+  reliability: reliable
+  durability: transient_local
+  history: keep_all
+  depth: 10

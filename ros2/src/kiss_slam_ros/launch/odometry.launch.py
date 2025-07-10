@@ -15,6 +15,7 @@ def generate_launch_description():
     topic = LaunchConfiguration("topic", default="/ouster/points")
     bagfile = LaunchConfiguration("bagfile", default="")
     namespace = LaunchConfiguration("namespace", default="")
+    visualize = LaunchConfiguration("visualize", default="true")
 
 
     # Odometry node
@@ -34,22 +35,45 @@ def generate_launch_description():
         ],
     )
 
+    # RViz node
+    rviz_node = Node(
+        package="rviz2",
+        executable="rviz2",
+        output="screen",
+        namespace=namespace,
+        arguments=[
+            "-d",
+            PathJoinSubstitution(
+                [FindPackageShare("kiss_slam_ros"), "rviz", "odom.rviz"]
+            ),
+        ],
+        condition=IfCondition(visualize),
+    )
+
     # Bag playback
     bagfile_play = ExecuteProcess(
-        # --remap /j100_0819/tf:=/tf /j100_0819/tf_static:=/tf_static
-        cmd=["ros2", "bag", "play", "--rate", "1", bagfile, "--clock", "1000.0", "--remap", "/j100_0819/tf:=/tf", "--remap", "/j100_0819/tf_static:=/tf_static"],
+        cmd=[
+            "ros2", "bag", "play",
+            bagfile,
+            "--rate", "2",
+            "--clock",
+            "--remap", "/j100_0819/tf:=/tf",
+            "--remap", "/j100_0819/tf_static:=/tf_static",
+            "--remap", "/ouster/tf_static:=/tf_static",
+        ],
         output="screen",
         condition=IfCondition(PythonExpression(["'", bagfile, "' != ''"])),
     )
-
     return LaunchDescription(
         [
             DeclareLaunchArgument("use_sim_time", default_value="true"),
-            DeclareLaunchArgument("topic", default_value="/j100_0000/sensors/lidar3d_0/points"),
+            DeclareLaunchArgument("visualize", default_value="true"),
+            DeclareLaunchArgument("topic", default_value="/ouster/points"),
             DeclareLaunchArgument("base_frame", default_value="base_link"),
             DeclareLaunchArgument("odom_frame", default_value="odom"),
             DeclareLaunchArgument("namespace", default_value=""),
             odometry_node,
             bagfile_play,
+            rviz_node,
         ]
     )
