@@ -60,7 +60,7 @@ class SLAMNode(Node):
         local_map_config = self.config.local_mapper
         self.local_map_voxel_size = local_map_config.voxel_size
         self.voxel_grid = VoxelMap(self.local_map_voxel_size)
-        self.odom_local_map = VoxelMap(1.5)  # Larger voxel size for odometry local map
+        self.odom_local_map = VoxelMap(self.local_map_voxel_size)
         self.local_map_graph = LocalMapGraph()
         self.local_map_splitting_distance = local_map_config.splitting_distance
         self.optimizer = PoseGraphOptimizer(self.config.pose_graph_optimizer)
@@ -94,12 +94,10 @@ class SLAMNode(Node):
 
     def _init_publishers(self):
         """Initialize all ROS publishers."""
-        map_qos = QoSProfile(durability=DurabilityPolicy.TRANSIENT_LOCAL, reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST, depth=10)
-        path_qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST, depth=10)
+        qos = QoSProfile(durability=DurabilityPolicy.VOLATILE, reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=10)
         # self.slam_path_pub = self.create_publisher(Path, 'slam_path', path_qos)
-        self.map_pub = self.create_publisher(OccupancyGrid, 'map', map_qos)
-        self.pose_pub = self.create_publisher(PoseStamped, 'global_pose', path_qos)
-        self.global_voxel_map_pub = self.create_publisher(PointCloud2, 'global_voxel_map', map_qos)
+        self.pose_pub = self.create_publisher(PoseStamped, 'global_pose', qos)
+        self.global_voxel_map_pub = self.create_publisher(PointCloud2, 'global_voxel_map', qos)
         # self.create_timer(2.0, self.publish_2D_map, callback_group=self.slow_callback_group)  # Publish map every 2 seconds
         # self.create_timer(0.2, self.publish_slam_path, callback_group=self.slow_callback_group) # Only for debugging purposes and visualization
 
@@ -107,9 +105,10 @@ class SLAMNode(Node):
         """Initialize message_filters subscribers to synchronize keyframe data."""
         # Subscribe to the local map and the corresponding odometry pose
         qos = QoSProfile(
-            history=HistoryPolicy.KEEP_ALL,
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            depth=10
         )
         deskewed_points_sub = Subscriber(
             self,

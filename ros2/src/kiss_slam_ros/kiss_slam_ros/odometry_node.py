@@ -43,7 +43,7 @@ class OdometryNode(Node):
 
     def _init_publishers(self):
         """Initialize all ROS publishers."""
-        qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_ALL, durability=DurabilityPolicy.TRANSIENT_LOCAL, depth=10)
+        qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, durability=DurabilityPolicy.VOLATILE, depth=10)
         self.deskewed_pub = self.create_publisher(PointCloud2, 'deskewed_points', qos)
         self.odom_pub = self.create_publisher(Odometry, 'odometry', qos)
 
@@ -62,7 +62,7 @@ class OdometryNode(Node):
         )
 
         self.create_subscription(
-            PointCloud2, '/points_raw', self.listener_callback, qosr_profile
+            PointCloud2, '/points_raw', self.listener_callback, qosb_profile
         )
 
     def listener_callback(self, msg: PointCloud2):

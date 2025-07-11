@@ -68,7 +68,7 @@ def generate_launch_description():
         condition=IfCondition(visualize),
     )
 
-    # Bag playback
+    # Bag playback, use this yaml file to override QoS settings for the bag playback
     override_qos_yaml = PathJoinSubstitution([
         FindPackageShare('kiss_slam_ros'),
         'config',
@@ -78,10 +78,10 @@ def generate_launch_description():
     bagfile_play = ExecuteProcess(
         cmd=[
             'ros2', 'bag', 'play',
-            '--rate', '1',
+            '--rate', '5',
             bagfile,
             '--clock',
-            '--qos-profile-overrides-path', override_qos_yaml,
+            # '--qos-profile-overrides-path', override_qos_yaml,
             '--remap', '/j100_0819/tf:=/tf',
             '--remap', '/j100_0819/tf_static:=/tf_static'
         ],
